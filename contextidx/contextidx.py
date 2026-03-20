@@ -4,16 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from contextidx.backends.base import VectorBackend
 from contextidx.core.conflict_resolver import ConflictResolver
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.core.decay_engine import DecayEngine
+from contextidx.core.embedding import EmbeddingFunction
 from contextidx.core.scoring_engine import ScoringEngine
 from contextidx.core.temporal_graph import Relationship, TemporalGraph
+from contextidx.exceptions import (
+    BackendError,
+    ConfigurationError,
+    EmbeddingError,
+    StoreError,
+)
 from contextidx.store.base import Store
 from contextidx.store.sqlite_store import SQLiteStore
 from contextidx.utils.batch_writer import BatchWriter
@@ -24,42 +37,54 @@ from contextidx.utils.wal import WAL
 logger = logging.getLogger("contextidx")
 
 
-class EmbeddingProvider:
-    """Generates text embeddings via OpenAI-compatible API."""
+class OpenAIEmbeddingProvider:
+    """Default embedding provider using the OpenAI API.
+
+    Implements :class:`~contextidx.core.embedding.EmbeddingFunction`.
+    """
 
     def __init__(self, api_key: str | None = None, model: str = "text-embedding-3-small"):
         self._model = model
         self._client: object | None = None
         self._api_key = api_key
 
-    async def embed(self, text: str) -> list[float]:
+    def _ensure_client(self) -> None:
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
                 self._client = AsyncOpenAI(api_key=self._api_key)
             except ImportError:
-                raise ImportError(
-                    "openai package required for embedding generation. "
-                    "Install with: pip install openai"
+                raise EmbeddingError(
+                    "openai package required for default embedding provider. "
+                    "Install with: pip install openai  — or supply a custom "
+                    "embedding_fn to ContextIdx."
                 )
-        response = await self._client.embeddings.create(  # type: ignore[union-attr]
-            input=text,
-            model=self._model,
-        )
-        return response.data[0].embedding
+
+    async def embed(self, text: str) -> list[float]:
+        self._ensure_client()
+        try:
+            response = await self._client.embeddings.create(  # type: ignore[union-attr]
+                input=text,
+                model=self._model,
+            )
+            return response.data[0].embedding
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Embedding API call failed: {exc}") from exc
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        if self._client is None:
-            try:
-                from openai import AsyncOpenAI
-                self._client = AsyncOpenAI(api_key=self._api_key)
-            except ImportError:
-                raise ImportError("openai package required.")
-        response = await self._client.embeddings.create(  # type: ignore[union-attr]
-            input=texts,
-            model=self._model,
-        )
-        return [d.embedding for d in response.data]
+        self._ensure_client()
+        try:
+            response = await self._client.embeddings.create(  # type: ignore[union-attr]
+                input=texts,
+                model=self._model,
+            )
+            return [d.embedding for d in response.data]
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Batch embedding API call failed: {exc}") from exc
 
 
 class ContextIdx:
@@ -84,6 +109,7 @@ class ContextIdx:
         internal_store_path: str | None = None,
         internal_store_type: Literal["sqlite", "postgres", "auto"] = "auto",
         internal_store_dsn: str | None = None,
+        embedding_fn: EmbeddingFunction | None = None,
         openai_api_key: str | None = None,
         embedding_model: str = "text-embedding-3-small",
         state_path_interval: float = 60.0,
@@ -97,6 +123,50 @@ class ContextIdx:
         pending_buffer_type: Literal["memory", "redis"] = "memory",
         redis_url: str | None = None,
     ):
+        # ── Validate configuration ──
+        if half_life_days <= 0:
+            raise ConfigurationError(
+                f"half_life_days must be > 0, got {half_life_days}"
+            )
+        if not 0 <= decay_threshold <= 1:
+            raise ConfigurationError(
+                f"decay_threshold must be in [0, 1], got {decay_threshold}"
+            )
+        if state_path_interval <= 0:
+            raise ConfigurationError(
+                f"state_path_interval must be > 0, got {state_path_interval}"
+            )
+        if batch_size < 1:
+            raise ConfigurationError(f"batch_size must be >= 1, got {batch_size}")
+        if batch_flush_interval <= 0:
+            raise ConfigurationError(
+                f"batch_flush_interval must be > 0, got {batch_flush_interval}"
+            )
+        if reconcile_every_n_ticks < 1:
+            raise ConfigurationError(
+                f"reconcile_every_n_ticks must be >= 1, got {reconcile_every_n_ticks}"
+            )
+        if consolidation_every_n_ticks < 1:
+            raise ConfigurationError(
+                f"consolidation_every_n_ticks must be >= 1, got {consolidation_every_n_ticks}"
+            )
+        if wal_compact_every_n_ticks < 1:
+            raise ConfigurationError(
+                f"wal_compact_every_n_ticks must be >= 1, got {wal_compact_every_n_ticks}"
+            )
+        if (
+            internal_store_type == "postgres"
+            and not internal_store_dsn
+            and internal_store is None
+        ):
+            raise ConfigurationError(
+                "internal_store_dsn is required when internal_store_type='postgres'"
+            )
+        if pending_buffer_type == "redis" and not redis_url:
+            raise ConfigurationError(
+                "redis_url is required when pending_buffer_type='redis'"
+            )
+
         self._backend = backend
         self._decay_model = decay_model
         self._decay_rate = ContextUnit.decay_rate_from_half_life(half_life_days)
@@ -112,7 +182,7 @@ class ContextIdx:
         if pending_buffer_type == "redis":
             from contextidx.utils.redis_pending_buffer import RedisPendingBuffer
             self._pending: PendingBuffer | RedisPendingBuffer = RedisPendingBuffer(
-                redis_url=redis_url or "redis://localhost:6379/0",
+                redis_url=redis_url,  # type: ignore[arg-type]  # validated above
             )
         else:
             self._pending = PendingBuffer()
@@ -144,7 +214,11 @@ class ContextIdx:
             self._conflict_queue = ConflictQueue(self._conflict_resolver)
 
         self._wal: WAL | None = None
-        self._embedder = EmbeddingProvider(api_key=openai_api_key, model=embedding_model)
+        self._embedder: EmbeddingFunction = (
+            embedding_fn
+            if embedding_fn is not None
+            else OpenAIEmbeddingProvider(api_key=openai_api_key, model=embedding_model)
+        )
         self._state_path_interval = state_path_interval
         self._decay_threshold = decay_threshold
         self._reconcile_every_n_ticks = reconcile_every_n_ticks
@@ -161,7 +235,7 @@ class ContextIdx:
         if enable_batching:
             self._batch_writer = BatchWriter(
                 store_fn=self._astore_direct,
-                embed_batch_fn=self._embedder.embed_batch,
+                embed_batch_fn=self._embed_batch,
                 batch_size=batch_size,
                 flush_interval=batch_flush_interval,
             )
@@ -211,6 +285,65 @@ class ContextIdx:
     def _ensure_initialized(self) -> None:
         if not self._initialized:
             raise RuntimeError("ContextIdx not initialized. Call ainitialize() first.")
+
+    # ── Resilience helpers ──
+
+    _retry_transient = retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+        retry=retry_if_exception_type((OSError, ConnectionError, TimeoutError)),
+        reraise=True,
+    )
+
+    @_retry_transient
+    async def _embed(self, text: str) -> list[float]:
+        try:
+            return await self._embedder.embed(text)
+        except (OSError, ConnectionError, TimeoutError):
+            raise
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Embedding failed: {exc}") from exc
+
+    @_retry_transient
+    async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        try:
+            return await self._embedder.embed_batch(texts)
+        except (OSError, ConnectionError, TimeoutError):
+            raise
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Batch embedding failed: {exc}") from exc
+
+    @_retry_transient
+    async def _backend_store(
+        self, *, id: str, embedding: list[float], metadata: dict
+    ) -> None:
+        try:
+            await self._backend.store(id=id, embedding=embedding, metadata=metadata)
+        except (OSError, ConnectionError, TimeoutError):
+            raise
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise BackendError(f"Backend store failed: {exc}") from exc
+
+    @_retry_transient
+    async def _backend_search(
+        self, *, query_embedding: list[float], top_k: int, filters: dict | None
+    ) -> list:
+        try:
+            return await self._backend.search(
+                query_embedding=query_embedding, top_k=top_k, filters=filters,
+            )
+        except (OSError, ConnectionError, TimeoutError):
+            raise
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise BackendError(f"Backend search failed: {exc}") from exc
 
     # ── Write Path ──
 
@@ -290,7 +423,7 @@ class ContextIdx:
         if embedding is not None:
             unit.embedding = embedding
         else:
-            unit.embedding = await self._embedder.embed(content)
+            unit.embedding = await self._embed(content)
 
         wal_seq = await self._wal.append(
             unit_id=unit.id,
@@ -325,7 +458,7 @@ class ContextIdx:
                 unit = result.winner
                 superseded_units = result.superseded
 
-        await self._backend.store(
+        await self._backend_store(
             id=unit.id,
             embedding=unit.embedding,
             metadata={"scope": unit.scope, "source": unit.source},
@@ -364,7 +497,7 @@ class ContextIdx:
         """
         self._ensure_initialized()
         texts = [item["content"] for item in items]
-        embeddings = await self._embedder.embed_batch(texts)
+        embeddings = await self._embed_batch(texts)
         ids: list[str] = []
         for item, emb in zip(items, embeddings):
             uid = await self._astore_direct(embedding=emb, **item)
@@ -421,7 +554,7 @@ class ContextIdx:
         if query_embedding is not None:
             q_emb = query_embedding
         else:
-            q_emb = await self._embedder.embed(query)
+            q_emb = await self._embed(query)
 
         # 2. Over-fetch from vector backend — use hybrid when supported
         fetch_k = top_k * 3
@@ -435,7 +568,7 @@ class ContextIdx:
                 filters=scope,
             )
         else:
-            raw_results = await self._backend.search(
+            raw_results = await self._backend_search(
                 query_embedding=q_emb,
                 top_k=fetch_k,
                 filters=scope,
@@ -635,20 +768,20 @@ class ContextIdx:
             if unit is None:
                 continue
             try:
-                results = await self._backend.search(
+                results = await self._backend_search(
                     query_embedding=unit.embedding or [],
                     top_k=1,
                     filters=unit.scope,
                 )
                 found = any(r.id == uid for r in results)
                 if not found and unit.embedding:
-                    await self._backend.store(
+                    await self._backend_store(
                         id=unit.id,
                         embedding=unit.embedding,
                         metadata={"scope": unit.scope, "source": unit.source},
                     )
                     reinserted += 1
-            except Exception:
+            except BackendError:
                 logger.exception("Reconciliation failed for unit %s", uid)
                 errors += 1
 
@@ -698,8 +831,10 @@ class ContextIdx:
         while self._running:
             try:
                 await self._state_path_tick()
+            except (StoreError, BackendError) as exc:
+                logger.exception("State path tick error: %s", exc)
             except Exception:
-                logger.exception("State path tick error")
+                logger.exception("Unexpected state path tick error")
             await asyncio.sleep(self._state_path_interval)
 
     async def _state_path_tick(self) -> None:
@@ -709,25 +844,33 @@ class ContextIdx:
         if self._conflict_queue is not None:
             try:
                 await self._conflict_queue.drain(self._apply_conflict_resolution)
+            except (StoreError, BackendError) as exc:
+                logger.exception("Conflict queue drain failed: %s", exc)
             except Exception:
-                logger.exception("Conflict queue drain failed")
+                logger.exception("Unexpected conflict queue error")
 
         self._tick_count += 1
         if self._tick_count % self._reconcile_every_n_ticks == 0:
             try:
                 await self.areconcile()
+            except (StoreError, BackendError) as exc:
+                logger.exception("Periodic reconciliation failed: %s", exc)
             except Exception:
-                logger.exception("Periodic reconciliation failed")
+                logger.exception("Unexpected reconciliation error")
         if self._tick_count % self._consolidation_every_n_ticks == 0:
             try:
                 await self._consolidation_tick()
+            except (StoreError, BackendError) as exc:
+                logger.exception("Consolidation tick failed: %s", exc)
             except Exception:
-                logger.exception("Consolidation tick failed")
+                logger.exception("Unexpected consolidation error")
         if self._tick_count % self._wal_compact_every_n_ticks == 0:
             try:
                 await self._wal_compact_tick()
+            except (StoreError, BackendError) as exc:
+                logger.exception("WAL compaction tick failed: %s", exc)
             except Exception:
-                logger.exception("WAL compaction tick failed")
+                logger.exception("Unexpected WAL compaction error")
 
     async def _consolidation_tick(self) -> None:
         """Merge semantically redundant units within each scope."""
@@ -798,15 +941,18 @@ class ContextIdx:
                     existing = await self._store.get_unit(unit.id)
                     if existing is None:
                         if unit.embedding:
-                            await self._backend.store(
+                            await self._backend_store(
                                 id=unit.id,
                                 embedding=unit.embedding,
                                 metadata={"scope": unit.scope, "source": unit.source},
                             )
                         await self._store.create_unit(unit)
                 await self._wal.mark_applied(entry.seq)
+            except (StoreError, BackendError) as exc:
+                logger.exception("WAL replay failed for seq=%d: %s", entry.seq, exc)
+                await self._wal.mark_failed(entry.seq)
             except Exception:
-                logger.exception("WAL replay failed for seq=%d", entry.seq)
+                logger.exception("Unexpected WAL replay error for seq=%d", entry.seq)
                 await self._wal.mark_failed(entry.seq)
 
     # ── Graph Loading ──

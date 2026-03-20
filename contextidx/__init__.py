@@ -2,9 +2,30 @@
 
 from contextidx.contextidx import ContextIdx
 from contextidx.core.context_unit import ContextUnit
+from contextidx.core.embedding import EmbeddingFunction
 from contextidx.backends.base import VectorBackend, SearchResult
+from contextidx.exceptions import (
+    BackendError,
+    ConfigurationError,
+    ContextIdxError,
+    ConflictError,
+    EmbeddingError,
+    StoreError,
+)
 
-__all__ = ["ContextIdx", "ContextUnit", "VectorBackend", "SearchResult"]
+__all__ = [
+    "ContextIdx",
+    "ContextUnit",
+    "EmbeddingFunction",
+    "VectorBackend",
+    "SearchResult",
+    "ContextIdxError",
+    "ConfigurationError",
+    "StoreError",
+    "BackendError",
+    "EmbeddingError",
+    "ConflictError",
+]
 __version__ = "1.0.0"
 
 # Conditionally export backends that have their dependencies installed
