@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timezone
 
 from contextidx.core.context_unit import ContextUnit
-from contextidx.store.base import Store
+from contextidx.store.base import Store, validate_scope_keys
 from contextidx.store.postgres_schema import INDEXES_SQL, SCHEMA_SQL
 
 try:
@@ -106,6 +106,14 @@ class PostgresStore(Store):
             return None
         return _row_to_unit(row)
 
+    async def get_units_batch(self, unit_ids: list[str]) -> dict[str, ContextUnit]:
+        if not unit_ids:
+            return {}
+        rows = await self._conn_pool.fetch(
+            "SELECT * FROM context_units WHERE id = ANY($1::text[])", unit_ids,
+        )
+        return {row["id"]: _row_to_unit(row) for row in rows}
+
     async def update_unit(self, unit_id: str, updates: dict) -> None:
         if not updates:
             return
@@ -138,6 +146,7 @@ class PostgresStore(Store):
         include_superseded: bool = False,
         include_archived: bool = False,
     ) -> list[ContextUnit]:
+        validate_scope_keys(scope)
         conditions = ["1=1"]
         params: list = []
         idx = 1
@@ -222,6 +231,21 @@ class PostgresStore(Store):
         if row is None:
             return None
         return (float(row["current_score"]), row["last_updated"], row["reinforcement_count"])
+
+    async def get_decay_states_batch(
+        self, unit_ids: list[str]
+    ) -> dict[str, tuple[float, datetime, int]]:
+        if not unit_ids:
+            return {}
+        rows = await self._conn_pool.fetch(
+            "SELECT unit_id, current_score, last_updated, reinforcement_count "
+            "FROM decay_state WHERE unit_id = ANY($1::text[])",
+            unit_ids,
+        )
+        return {
+            r["unit_id"]: (float(r["current_score"]), r["last_updated"], r["reinforcement_count"])
+            for r in rows
+        }
 
     async def increment_reinforcement(self, unit_id: str) -> int:
         await self._conn_pool.execute(

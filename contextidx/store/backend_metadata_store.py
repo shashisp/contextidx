@@ -57,6 +57,19 @@ class BackendMetadataStore(Store):
             return self._units_cache[unit_id]
         return await self._sqlite.get_unit(unit_id)
 
+    async def get_units_batch(self, unit_ids: list[str]) -> dict[str, ContextUnit]:
+        result: dict[str, ContextUnit] = {}
+        missing: list[str] = []
+        for uid in unit_ids:
+            if uid in self._units_cache:
+                result[uid] = self._units_cache[uid]
+            else:
+                missing.append(uid)
+        if missing:
+            from_db = await self._sqlite.get_units_batch(missing)
+            result.update(from_db)
+        return result
+
     async def update_unit(self, unit_id: str, updates: dict) -> None:
         await self._sqlite.update_unit(unit_id, updates)
         await self._backend.update_metadata(unit_id, updates)
@@ -119,6 +132,11 @@ class BackendMetadataStore(Store):
         self, unit_id: str
     ) -> tuple[float, datetime, int] | None:
         return await self._sqlite.get_decay_state(unit_id)
+
+    async def get_decay_states_batch(
+        self, unit_ids: list[str]
+    ) -> dict[str, tuple[float, datetime, int]]:
+        return await self._sqlite.get_decay_states_batch(unit_ids)
 
     async def increment_reinforcement(self, unit_id: str) -> int:
         return await self._sqlite.increment_reinforcement(unit_id)

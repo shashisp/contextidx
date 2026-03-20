@@ -168,6 +168,13 @@ class ContextIdx:
 
     # ── Lifecycle ──
 
+    async def __aenter__(self) -> ContextIdx:
+        await self.ainitialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # noqa: ANN001
+        await self.aclose()
+
     async def ainitialize(self) -> None:
         """Initialize stores, replay WAL, start background tasks."""
         if self._initialized:
@@ -434,15 +441,21 @@ class ContextIdx:
                 filters=scope,
             )
 
-        # 3. Load full units and merge pending buffer
+        # 3. Collect all IDs we need, then batch-load from the store
+        pending = self._pending.get(scope)
+        pending_ids = list({pu.id for pu in pending})
+        result_ids = [sr.id for sr in raw_results if sr.id not in set(pending_ids)]
+
+        all_ids = pending_ids + result_ids
+        units_map = await self._store.get_units_batch(all_ids) if all_ids else {}
+
+        # Build candidate list: pending units first, then vector results
         candidates: list[tuple[ContextUnit, float, float | None]] = []
         seen_ids: set[str] = set()
 
-        pending = self._pending.get(scope)
         for pu in pending:
             if pu.id not in seen_ids:
-                stored = await self._store.get_unit(pu.id)
-                unit = stored if stored is not None else pu
+                unit = units_map.get(pu.id, pu)
                 candidates.append((unit, 1.0, None))
                 seen_ids.add(pu.id)
 
@@ -450,13 +463,23 @@ class ContextIdx:
             if sr.id in seen_ids:
                 continue
             seen_ids.add(sr.id)
-            unit = await self._store.get_unit(sr.id)
+            unit = units_map.get(sr.id)
             if unit is None:
                 continue
             bm25 = sr.metadata.get("bm25_score") if use_hybrid else None
             candidates.append((unit, sr.score, bm25))
 
-        # 4. Filter
+        # 4. Filter (collect superseder IDs for batch load in time-travel mode)
+        superseder_ids: list[str] = []
+        if at is not None:
+            for unit, _, _ in candidates:
+                sup_id = self._graph.find_superseded_by(unit.id)
+                if sup_id and sup_id not in units_map:
+                    superseder_ids.append(sup_id)
+            if superseder_ids:
+                sup_units = await self._store.get_units_batch(superseder_ids)
+                units_map.update(sup_units)
+
         filtered: list[tuple[ContextUnit, float, float | None]] = []
         for unit, sem_score, bm25 in candidates:
             if not unit.matches_scope(scope):
@@ -473,7 +496,7 @@ class ContextIdx:
                     continue
                 superseder = self._graph.find_superseded_by(unit.id)
                 if superseder:
-                    sup_unit = await self._store.get_unit(superseder)
+                    sup_unit = units_map.get(superseder)
                     if sup_unit and sup_unit.timestamp <= at:
                         continue
 
@@ -483,10 +506,17 @@ class ContextIdx:
 
             filtered.append((unit, sem_score, bm25))
 
-        # 5. Score and rank
+        # 5. Batch-load decay states, then score and rank
+        filtered_ids = [unit.id for unit, _, _ in filtered]
+        decay_states = (
+            await self._store.get_decay_states_batch(filtered_ids)
+            if filtered_ids
+            else {}
+        )
+
         scored: list[tuple[ContextUnit, float]] = []
         for unit, sem_score, bm25 in filtered:
-            state = await self._store.get_decay_state(unit.id)
+            state = decay_states.get(unit.id)
             reinforcement_count = state[2] if state else 0
             decay_score = self._decay_engine.compute_decay(
                 unit, query_time, reinforcement_count

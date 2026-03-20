@@ -7,7 +7,7 @@ from pathlib import Path
 import aiosqlite
 
 from contextidx.core.context_unit import ContextUnit
-from contextidx.store.base import Store
+from contextidx.store.base import Store, validate_scope_keys
 from contextidx.store.schema import INDEXES_SQL, SCHEMA_SQL
 
 _ISO = "%Y-%m-%dT%H:%M:%S.%f%z"
@@ -105,6 +105,16 @@ class SQLiteStore(Store):
             return None
         return _row_to_unit(row)
 
+    async def get_units_batch(self, unit_ids: list[str]) -> dict[str, ContextUnit]:
+        if not unit_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unit_ids)
+        cursor = await self._conn.execute(
+            f"SELECT * FROM context_units WHERE id IN ({placeholders})", unit_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: _row_to_unit(row) for row in rows}
+
     async def update_unit(self, unit_id: str, updates: dict) -> None:
         set_parts: list[str] = []
         values: list = []
@@ -140,6 +150,7 @@ class SQLiteStore(Store):
         include_superseded: bool = False,
         include_archived: bool = False,
     ) -> list[ContextUnit]:
+        validate_scope_keys(scope)
         query = "SELECT * FROM context_units WHERE 1=1"
         params: list = []
 
@@ -225,6 +236,27 @@ class SQLiteStore(Store):
         if row is None:
             return None
         return (row["current_score"], _str_to_dt(row["last_updated"]), row["reinforcement_count"])  # type: ignore[return-value]
+
+    async def get_decay_states_batch(
+        self, unit_ids: list[str]
+    ) -> dict[str, tuple[float, datetime, int]]:
+        if not unit_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unit_ids)
+        cursor = await self._conn.execute(
+            f"SELECT unit_id, current_score, last_updated, reinforcement_count "
+            f"FROM decay_state WHERE unit_id IN ({placeholders})",
+            unit_ids,
+        )
+        rows = await cursor.fetchall()
+        return {
+            row["unit_id"]: (
+                row["current_score"],
+                _str_to_dt(row["last_updated"]),  # type: ignore[arg-type]
+                row["reinforcement_count"],
+            )
+            for row in rows
+        }
 
     async def increment_reinforcement(self, unit_id: str) -> int:
         await self._conn.execute(

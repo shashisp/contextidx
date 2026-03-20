@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 
 from contextidx.core.context_unit import ContextUnit
+
+_SAFE_SCOPE_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def validate_scope_keys(scope: dict[str, str]) -> None:
+    """Raise ``ValueError`` if any scope key contains unsafe characters.
+
+    Scope keys are interpolated into SQL identifiers (json path expressions),
+    so they must be restricted to alphanumeric characters and underscores.
+    """
+    for key in scope:
+        if not _SAFE_SCOPE_KEY.match(key):
+            raise ValueError(
+                f"Invalid scope key {key!r}: must match [a-zA-Z_][a-zA-Z0-9_]*"
+            )
 
 
 class Store(ABC):
@@ -24,6 +40,19 @@ class Store(ABC):
 
     @abstractmethod
     async def get_unit(self, unit_id: str) -> ContextUnit | None: ...
+
+    async def get_units_batch(self, unit_ids: list[str]) -> dict[str, ContextUnit]:
+        """Return units for the given IDs as a {id: unit} mapping.
+
+        Subclasses should override with an efficient single-query implementation.
+        The default falls back to sequential ``get_unit`` calls.
+        """
+        result: dict[str, ContextUnit] = {}
+        for uid in unit_ids:
+            unit = await self.get_unit(uid)
+            if unit is not None:
+                result[uid] = unit
+        return result
 
     @abstractmethod
     async def update_unit(self, unit_id: str, updates: dict) -> None: ...
@@ -72,6 +101,21 @@ class Store(ABC):
     async def get_decay_state(
         self, unit_id: str
     ) -> tuple[float, datetime, int] | None: ...
+
+    async def get_decay_states_batch(
+        self, unit_ids: list[str]
+    ) -> dict[str, tuple[float, datetime, int]]:
+        """Return decay states for the given IDs as a {id: state} mapping.
+
+        Subclasses should override with an efficient single-query implementation.
+        The default falls back to sequential ``get_decay_state`` calls.
+        """
+        result: dict[str, tuple[float, datetime, int]] = {}
+        for uid in unit_ids:
+            state = await self.get_decay_state(uid)
+            if state is not None:
+                result[uid] = state
+        return result
 
     @abstractmethod
     async def increment_reinforcement(self, unit_id: str) -> int: ...
