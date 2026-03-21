@@ -17,6 +17,7 @@ htmlcov/
 
 dist/
 build/
+target/
 *.egg-info/
 
 .ruff_cache/
