@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 
@@ -36,6 +36,18 @@ class ConflictResult:
         self.needs_review = needs_review
 
 
+@runtime_checkable
+class ConflictJudgeFn(Protocol):
+    """Protocol for LLM-based conflict judges.
+
+    Given two statements from the same scope, return ``True`` if they
+    provide *different* answers to the same question/attribute (i.e. one
+    should supersede the other).
+    """
+
+    async def __call__(self, statement_a: str, statement_b: str) -> bool: ...
+
+
 class ConflictResolver:
     """Detects and resolves conflicting context units within the same scope."""
 
@@ -44,10 +56,12 @@ class ConflictResolver:
         strategy: Literal[
             "LAST_WRITE_WINS", "HIGHEST_CONFIDENCE", "MERGE", "MANUAL"
         ] = "LAST_WRITE_WINS",
-        semantic_threshold: float = 0.85,
+        semantic_threshold: float = 0.80,
+        conflict_judge_fn: ConflictJudgeFn | None = None,
     ):
         self._strategy = ConflictStrategy(strategy)
         self._semantic_threshold = semantic_threshold
+        self._judge_fn = conflict_judge_fn
 
     @property
     def strategy(self) -> ConflictStrategy:
@@ -100,9 +114,10 @@ class ConflictResolver:
     ) -> list[ContextUnit]:
         """Semantic conflict detection via embedding cosine similarity.
 
-        Units with similarity above ``_semantic_threshold`` that also show
-        contradictory negation patterns are flagged as conflicts.
-        Both the new unit and each existing unit must have embeddings.
+        Two units in the same scope with high embedding similarity are
+        treated as being about the same topic/attribute.  When that
+        happens the newer unit supersedes the older one — no explicit
+        negation pattern is required.
         """
         if not new_unit.embedding:
             return []
@@ -115,12 +130,39 @@ class ConflictResolver:
                 continue
             if not existing.embedding:
                 continue
+            if existing.id == new_unit.id:
+                continue
 
             sim = _cosine_similarity(new_unit.embedding, existing.embedding)
             if sim >= self._semantic_threshold:
-                if self._is_contradictory(new_unit.content, existing.content):
-                    conflicts.append(existing)
+                conflicts.append(existing)
         return conflicts
+
+    async def detect_llm_conflicts(
+        self,
+        new_unit: ContextUnit,
+        existing_units: list[ContextUnit],
+    ) -> list[ContextUnit]:
+        """LLM-assisted conflict detection for highest accuracy.
+
+        First narrows candidates using embedding similarity (same as
+        ``detect_semantic_conflicts``), then asks the configured
+        ``_judge_fn`` to confirm each candidate.  If no judge function
+        is configured, falls back to pure semantic detection.
+        """
+        semantic_candidates = self.detect_semantic_conflicts(new_unit, existing_units)
+        if not semantic_candidates or self._judge_fn is None:
+            return semantic_candidates
+
+        confirmed: list[ContextUnit] = []
+        for candidate in semantic_candidates:
+            try:
+                is_conflict = await self._judge_fn(new_unit.content, candidate.content)
+                if is_conflict:
+                    confirmed.append(candidate)
+            except Exception:
+                confirmed.append(candidate)
+        return confirmed
 
     def detect_tiered(
         self,

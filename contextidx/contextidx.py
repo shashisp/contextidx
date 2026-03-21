@@ -9,13 +9,14 @@ from typing import Literal
 
 from tenacity import (
     retry,
+    retry_base,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
 
 from contextidx.backends.base import VectorBackend
-from contextidx.core.conflict_resolver import ConflictResolver
+from contextidx.core.conflict_resolver import ConflictJudgeFn, ConflictResolver
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.core.decay_engine import DecayEngine
 from contextidx.core.embedding import EmbeddingFunction
@@ -100,10 +101,11 @@ class ContextIdx:
         *,
         decay_model: Literal["exponential", "linear", "step"] = "exponential",
         half_life_days: float = 30.0,
-        conflict_detection: Literal["rule_based", "semantic", "tiered"] = "rule_based",
+        conflict_detection: Literal["rule_based", "semantic", "tiered", "llm"] = "rule_based",
         conflict_strategy: Literal[
             "LAST_WRITE_WINS", "HIGHEST_CONFIDENCE", "MERGE", "MANUAL"
         ] = "LAST_WRITE_WINS",
+        conflict_judge_fn: ConflictJudgeFn | None = None,
         scoring_weights: dict[str, float] | None = None,
         internal_store: Store | None = None,
         internal_store_path: str | None = None,
@@ -122,6 +124,7 @@ class ContextIdx:
         wal_compact_every_n_ticks: int = 50,
         pending_buffer_type: Literal["memory", "redis"] = "memory",
         redis_url: str | None = None,
+        recency_bias: float | None = None,
     ):
         # ── Validate configuration ──
         if half_life_days <= 0:
@@ -166,6 +169,10 @@ class ContextIdx:
             raise ConfigurationError(
                 "redis_url is required when pending_buffer_type='redis'"
             )
+        if recency_bias is not None and not 0 <= recency_bias <= 1:
+            raise ConfigurationError(
+                f"recency_bias must be in [0, 1], got {recency_bias}"
+            )
 
         self._backend = backend
         self._decay_model = decay_model
@@ -175,7 +182,10 @@ class ContextIdx:
 
         self._decay_engine = DecayEngine()
         self._scoring_engine = ScoringEngine(weights=scoring_weights)
-        self._conflict_resolver = ConflictResolver(strategy=conflict_strategy)
+        self._conflict_resolver = ConflictResolver(
+            strategy=conflict_strategy,
+            conflict_judge_fn=conflict_judge_fn,
+        )
         self._graph = TemporalGraph()
 
         # Pending buffer: in-memory or Redis-backed
@@ -221,6 +231,7 @@ class ContextIdx:
         )
         self._state_path_interval = state_path_interval
         self._decay_threshold = decay_threshold
+        self._recency_bias = recency_bias or 0.0
         self._reconcile_every_n_ticks = reconcile_every_n_ticks
         self._consolidation_every_n_ticks = consolidation_every_n_ticks
         self._wal_compact_every_n_ticks = wal_compact_every_n_ticks
@@ -288,6 +299,19 @@ class ContextIdx:
 
     # ── Resilience helpers ──
 
+    class _retry_rate_limit(retry_base):
+        """Retry on transient errors and OpenAI rate-limit / quota 429s."""
+
+        def __call__(self, retry_state: "RetryCallState") -> bool:  # type: ignore[override]
+            exc = retry_state.outcome.exception() if retry_state.outcome else None
+            if exc is None:
+                return False
+            if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+                return True
+            if isinstance(exc, EmbeddingError) and "429" in str(exc):
+                return True
+            return False
+
     _retry_transient = retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
@@ -295,7 +319,14 @@ class ContextIdx:
         reraise=True,
     )
 
-    @_retry_transient
+    _retry_embedding = retry(
+        stop=stop_after_attempt(6),
+        wait=wait_exponential(multiplier=2, min=2, max=120),
+        retry=_retry_rate_limit(),
+        reraise=True,
+    )
+
+    @_retry_embedding
     async def _embed(self, text: str) -> list[float]:
         try:
             return await self._embedder.embed(text)
@@ -306,7 +337,7 @@ class ContextIdx:
         except Exception as exc:
             raise EmbeddingError(f"Embedding failed: {exc}") from exc
 
-    @_retry_transient
+    @_retry_embedding
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         try:
             return await self._embedder.embed_batch(texts)
@@ -358,6 +389,7 @@ class ContextIdx:
         decay_rate: float | None = None,
         expires_at: datetime | None = None,
         wait_for_conflict: bool = False,
+        timestamp: datetime | None = None,
     ) -> str:
         """Store a context unit (async).
 
@@ -391,6 +423,7 @@ class ContextIdx:
             decay_rate=decay_rate,
             expires_at=expires_at,
             wait_for_conflict=wait_for_conflict,
+            timestamp=timestamp,
         )
 
     async def _astore_direct(
@@ -404,6 +437,7 @@ class ContextIdx:
         decay_rate: float | None = None,
         expires_at: datetime | None = None,
         wait_for_conflict: bool = False,
+        timestamp: datetime | None = None,
     ) -> str:
         """Direct (non-batched) store path."""
         self._ensure_initialized()
@@ -419,6 +453,8 @@ class ContextIdx:
             decay_rate=decay_rate or self._decay_rate,
             expires_at=expires_at,
         )
+        if timestamp is not None:
+            unit.timestamp = timestamp
 
         if embedding is not None:
             unit.embedding = embedding
@@ -445,6 +481,12 @@ class ContextIdx:
                 superseded_units = result.superseded
             if candidates and self._conflict_queue is not None:
                 await self._conflict_queue.enqueue(unit, candidates)
+        elif self._conflict_detection == "llm":
+            conflicts = await self._conflict_resolver.detect_llm_conflicts(unit, existing)
+            if conflicts:
+                result = self._conflict_resolver.resolve(unit, conflicts)
+                unit = result.winner
+                superseded_units = result.superseded
         elif self._conflict_detection == "semantic":
             conflicts = self._conflict_resolver.detect_semantic_conflicts(unit, existing)
             if conflicts:
@@ -461,7 +503,7 @@ class ContextIdx:
         await self._backend_store(
             id=unit.id,
             embedding=unit.embedding,
-            metadata={"scope": unit.scope, "source": unit.source},
+            metadata={"scope": unit.scope, "source": unit.source, "_content": unit.content},
         )
         await self._store.create_unit(unit)
 
@@ -535,6 +577,8 @@ class ContextIdx:
         at: datetime | None = None,
         query_embedding: list[float] | None = None,
         min_score: float = 0.0,
+        recency_bias: float | None = None,
+        rerank: bool = False,
     ) -> list[ContextUnit]:
         """Retrieve temporally-scored context units (async).
 
@@ -545,6 +589,12 @@ class ContextIdx:
             at: Point-in-time for time-travel queries. ``None`` means now.
             query_embedding: Pre-computed query embedding (skips API call).
             min_score: Minimum composite score threshold.
+            recency_bias: When set (0.0-1.0), items whose decay score is
+                below ``recency_bias * max_decay`` among candidates are
+                dropped.  Overrides the instance-level ``_recency_bias``
+                if provided.  ``None`` falls back to the constructor value.
+            rerank: When True, apply an LLM-based re-ranking step to
+                improve precision. Uses gpt-4o-mini for low latency.
         """
         self._ensure_initialized()
 
@@ -639,6 +689,31 @@ class ContextIdx:
 
             filtered.append((unit, sem_score, bm25))
 
+        # 4b. Graph expansion: follow RELATES_TO edges from top candidates
+        # to pull in neighboring context that vector search may have missed.
+        expansion_ids: set[str] = set()
+        filtered_id_set = {u.id for u, _, _ in filtered}
+        for unit, _, _ in filtered[:top_k]:
+            related = self._graph.get_related(unit.id)
+            for rid in related:
+                if rid not in filtered_id_set and rid not in seen_ids:
+                    expansion_ids.add(rid)
+
+        if expansion_ids:
+            expanded_units = await self._store.get_units_batch(list(expansion_ids))
+            for uid, exp_unit in expanded_units.items():
+                if exp_unit is None:
+                    continue
+                if exp_unit.is_superseded or exp_unit.is_expired:
+                    continue
+                if not exp_unit.matches_scope(scope):
+                    continue
+                decay_sc = self._decay_engine.compute_decay(exp_unit, query_time)
+                if decay_sc < self._decay_threshold:
+                    continue
+                filtered.append((exp_unit, 0.5, None))
+                filtered_id_set.add(uid)
+
         # 5. Batch-load decay states, then score and rank
         filtered_ids = [unit.id for unit, _, _ in filtered]
         decay_states = (
@@ -647,7 +722,7 @@ class ContextIdx:
             else {}
         )
 
-        scored: list[tuple[ContextUnit, float]] = []
+        scored: list[tuple[ContextUnit, float, float]] = []
         for unit, sem_score, bm25 in filtered:
             state = decay_states.get(unit.id)
             reinforcement_count = state[2] if state else 0
@@ -663,10 +738,93 @@ class ContextIdx:
                 bm25_score=bm25,
             )
             if composite >= min_score:
-                scored.append((unit, composite))
+                scored.append((unit, composite, decay_score))
+
+        effective_bias = recency_bias if recency_bias is not None else self._recency_bias
+        if effective_bias and effective_bias > 0 and scored:
+            max_decay = max(ds for _, _, ds in scored)
+            cutoff = effective_bias * max_decay
+            scored = [(u, c, ds) for u, c, ds in scored if ds >= cutoff]
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [unit for unit, _ in scored[:top_k]]
+
+        # 7. Optional LLM re-ranking for higher precision
+        if rerank and scored:
+            scored = await self._rerank_with_llm(query, scored, top_k)
+
+        results: list[ContextUnit] = []
+        for unit, composite, _ in scored[:top_k]:
+            unit.confidence = composite
+            results.append(unit)
+        return results
+
+    async def _rerank_with_llm(
+        self,
+        query: str,
+        scored: list[tuple[ContextUnit, float, float]],
+        top_k: int,
+    ) -> list[tuple[ContextUnit, float, float]]:
+        """Re-rank candidates using gpt-4o-mini for relevance scoring.
+
+        Takes the top 2*top_k candidates and asks the LLM to score each on
+        a 0-10 relevance scale. Falls back to original ordering on error.
+        """
+        rerank_pool = scored[: top_k * 2]
+        if len(rerank_pool) <= 1:
+            return scored
+
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            logger.warning("openai not installed; skipping LLM re-rank")
+            return scored
+
+        try:
+            client = AsyncOpenAI()
+            numbered = "\n".join(
+                f"[{i}] {u.content[:300]}" for i, (u, _, _) in enumerate(rerank_pool)
+            )
+            resp = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a relevance judge. Given a query and numbered text passages, "
+                            "rate each passage's relevance to the query on a scale of 0-10. "
+                            "Output ONLY a JSON array of objects with 'index' and 'score' keys. "
+                            "Example: [{\"index\":0,\"score\":8},{\"index\":1,\"score\":3}]"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Query: {query}\n\nPassages:\n{numbered}",
+                    },
+                ],
+            )
+            import json as _json
+
+            raw = resp.choices[0].message.content or "[]"
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            rankings = _json.loads(raw)
+            score_map: dict[int, float] = {r["index"]: float(r["score"]) for r in rankings}
+
+            reranked: list[tuple[ContextUnit, float, float]] = []
+            for i, (unit, composite, decay) in enumerate(rerank_pool):
+                llm_score = score_map.get(i, 5.0) / 10.0
+                blended = 0.4 * composite + 0.6 * llm_score
+                reranked.append((unit, blended, decay))
+            reranked.sort(key=lambda x: x[1], reverse=True)
+
+            remaining = scored[top_k * 2 :]
+            return reranked + remaining
+
+        except Exception:
+            logger.warning("LLM re-rank failed; using original scores", exc_info=True)
+            return scored
 
     def retrieve(
         self,
@@ -675,6 +833,7 @@ class ContextIdx:
         top_k: int = 5,
         at: datetime | None = None,
         query_embedding: list[float] | None = None,
+        recency_bias: float | None = None,
         **kwargs,
     ) -> list[ContextUnit]:
         """Retrieve temporally-scored context units (sync wrapper)."""
@@ -685,9 +844,76 @@ class ContextIdx:
                 top_k=top_k,
                 at=at,
                 query_embedding=query_embedding,
+                recency_bias=recency_bias,
                 **kwargs,
             )
         )
+
+    # ── Supersede ──
+
+    async def asupersede(self, new_id: str, old_id: str) -> None:
+        """Explicitly mark *old_id* as superseded by *new_id*.
+
+        Use this when automatic semantic detection is insufficient and
+        the application knows that a newer unit replaces an older one.
+        """
+        self._ensure_initialized()
+        old_unit = await self._store.get_unit(old_id)
+        if old_unit is None:
+            raise ValueError(f"Unit {old_id!r} not found")
+        new_unit = await self._store.get_unit(new_id)
+        if new_unit is None:
+            raise ValueError(f"Unit {new_id!r} not found")
+        await self._store.update_unit(old_id, {"superseded_by": new_id})
+        now = datetime.now(timezone.utc)
+        self._graph.add_edge(new_id, old_id, Relationship.SUPERSEDES, now)
+        await self._store.add_graph_edge(new_id, old_id, "supersedes", now)
+        logger.debug("Explicit supersede: %s supersedes %s", new_id, old_id)
+
+    def supersede(self, new_id: str, old_id: str) -> None:
+        """Sync wrapper for :meth:`asupersede`."""
+        asyncio.run(self.asupersede(new_id, old_id))
+
+    # ── Graph linking ──
+
+    async def alink_related(self, id_a: str, id_b: str) -> None:
+        """Create a bidirectional RELATES_TO edge between two units.
+
+        Used to connect chunks from the same session so that graph-expanded
+        retrieval can pull in neighboring context.
+        """
+        self._ensure_initialized()
+        now = datetime.now(timezone.utc)
+        self._graph.add_edge(id_a, id_b, Relationship.RELATES_TO, now)
+        await self._store.add_graph_edge(id_a, id_b, "relates_to", now)
+
+    # ── Clear ──
+
+    async def aclear(self, scope: dict[str, str]) -> int:
+        """Delete all units matching *scope* from both the store and backend.
+
+        Returns the number of units removed.
+        """
+        self._ensure_initialized()
+        units = await self._store.find_units_in_scope(
+            scope, include_superseded=True, include_archived=True,
+        )
+        for unit in units:
+            try:
+                await self._backend.delete(unit.id)
+            except Exception:
+                logger.debug("Backend delete failed for %s (may not exist)", unit.id)
+            await self._store.delete_unit(unit.id)
+        if hasattr(self._pending, "clear_scope"):
+            result = self._pending.clear_scope(scope)
+            if asyncio.iscoroutine(result):
+                await result
+        logger.info("Cleared %d units from scope %s", len(units), scope)
+        return len(units)
+
+    def clear(self, scope: dict[str, str]) -> int:
+        """Sync wrapper for :meth:`aclear`."""
+        return asyncio.run(self.aclear(scope))
 
     # ── Reinforce ──
 

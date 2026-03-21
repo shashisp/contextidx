@@ -63,5 +63,10 @@ class PendingBuffer:
             self._buffer[key] = still_alive
         return expired
 
+    def clear_scope(self, scope: dict[str, str]) -> None:
+        """Remove all pending units for *scope*."""
+        key = _hash_scope(scope)
+        self._buffer.pop(key, None)
+
     def clear(self) -> None:
         self._buffer.clear()

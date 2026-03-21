@@ -1,6 +1,7 @@
 """contextidx - A temporal context layer for your existing vector database."""
 
 from contextidx.contextidx import ContextIdx
+from contextidx.core.conflict_resolver import ConflictJudgeFn
 from contextidx.core.context_unit import ContextUnit
 from contextidx.core.embedding import EmbeddingFunction
 from contextidx.backends.base import VectorBackend, SearchResult
@@ -15,6 +16,7 @@ from contextidx.exceptions import (
 
 __all__ = [
     "ContextIdx",
+    "ConflictJudgeFn",
     "ContextUnit",
     "EmbeddingFunction",
     "VectorBackend",

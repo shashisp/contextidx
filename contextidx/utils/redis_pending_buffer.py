@@ -128,6 +128,11 @@ class RedisPendingBuffer:
                 await self._redis.zremrangebyscore(key, "-inf", cutoff)
         return expired
 
+    async def clear_scope(self, scope: dict[str, str]) -> None:
+        """Remove all pending units for *scope*."""
+        key = self._key(scope)
+        await self._redis.delete(key)
+
     async def clear(self) -> None:
         async for key in self._redis.scan_iter(match=f"{_KEY_PREFIX}*"):
             await self._redis.delete(key)
