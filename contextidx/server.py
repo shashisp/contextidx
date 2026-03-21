@@ -16,6 +16,8 @@ Configuration via environment variables:
     CONTEXTIDX_STORE_PATH     SQLite store path (default: .contextidx/memorybench.db)
     CONTEXTIDX_BACKEND        "memory" or a pgvector DSN (default: memory)
     CONTEXTIDX_RECENCY_BIAS   Recency bias 0-1 (default: none)
+    CONTEXTIDX_WINDOW_SIZE    Chunk window size in lines (default: 8)
+    CONTEXTIDX_STRIDE         Chunk stride in lines (default: 3)
 """
 
 from __future__ import annotations
@@ -126,8 +128,8 @@ def _build_app():
         document_ids: list[str] = []
         scope = {"container": req.containerTag}
 
-        WINDOW_SIZE = 8
-        STRIDE = 3
+        WINDOW_SIZE = int(os.environ.get("CONTEXTIDX_WINDOW_SIZE", "8"))
+        STRIDE = int(os.environ.get("CONTEXTIDX_STRIDE", "3"))
 
         items: list[dict] = []
         # Track how many chunks each session produces so we can link them

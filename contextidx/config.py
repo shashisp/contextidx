@@ -53,8 +53,15 @@ class ContextIdxConfig:
 
     graph_expansion_default_score: float = 0.5
     """Composite score assigned to units that enter the result set via graph
-    expansion (RELATES_TO edges) rather than vector search.  Set lower to
-    deprioritise graph-expanded results relative to direct hits."""
+    expansion (RELATES_TO edges) rather than vector search, when no embedding
+    is available to compute an exact similarity.  Set lower to deprioritise
+    graph-expanded results relative to direct hits."""
+
+    graph_expansion_min_score: float = 0.0
+    """Minimum cosine similarity required to include a graph-expanded unit.
+    Units whose embedding similarity to the query falls below this threshold
+    are silently dropped from graph expansion results.  Set to e.g. 0.3 to
+    filter out loosely-related neighbours."""
 
     # ── Consolidation ────────────────────────────────────────────────────────
 

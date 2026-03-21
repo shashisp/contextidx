@@ -21,6 +21,7 @@ from contextidx.core.conflict_resolver import ConflictJudgeFn, ConflictResolver
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.core.decay_engine import DecayEngine
 from contextidx.core.embedding import EmbeddingFunction
+from contextidx.core.query_type import detect_query_type, weights_for_query
 from contextidx.core.reranker import OpenAIReranker, RerankerFn
 from contextidx.core.scoring_engine import ScoringEngine
 from contextidx.core.temporal_graph import Relationship, TemporalGraph
@@ -33,6 +34,7 @@ from contextidx.exceptions import (
 from contextidx.store.base import Store, validate_scope_keys
 from contextidx.store.sqlite_store import SQLiteStore
 from contextidx.utils.batch_writer import BatchWriter
+from contextidx.utils.math_utils import cosine_similarity
 from contextidx.utils.conflict_queue import ConflictQueue
 from contextidx.utils.pending_buffer import PendingBuffer
 from contextidx.utils.wal import WAL
@@ -792,7 +794,14 @@ class ContextIdx:
                 decay_sc = self._decay_engine.compute_decay(exp_unit, query_time)
                 if decay_sc < self._decay_threshold:
                     continue
-                filtered.append((exp_unit, self._cfg.graph_expansion_default_score, None))
+                if q_emb and exp_unit.embedding:
+                    sim = cosine_similarity(q_emb, exp_unit.embedding)
+                    if sim < self._cfg.graph_expansion_min_score:
+                        continue
+                    exp_score = sim
+                else:
+                    exp_score = self._cfg.graph_expansion_default_score
+                filtered.append((exp_unit, exp_score, None))
                 filtered_id_set.add(uid)
 
         # 5. Batch-load decay states, then score and rank
@@ -803,6 +812,18 @@ class ContextIdx:
             else {}
         )
 
+        # Detect query type and build a scoring engine with adapted weights
+        q_type = detect_query_type(query)
+        dynamic_weights = weights_for_query(q_type)
+        # Respect any user-supplied weight overrides on top of dynamic weights
+        if self._cfg.scoring_weights:
+            dynamic_weights.update(self._cfg.scoring_weights)
+        scoring_engine = ScoringEngine(
+            weights=dynamic_weights,
+            recency_half_life_days=self._cfg.recency_half_life_days,
+            reinforcement_saturation=self._cfg.reinforcement_saturation,
+        )
+
         scored: list[tuple[ContextUnit, float, float]] = []
         for unit, sem_score, bm25 in filtered:
             state = decay_states.get(unit.id)
@@ -810,7 +831,7 @@ class ContextIdx:
             decay_score = self._decay_engine.compute_decay(
                 unit, query_time, reinforcement_count
             )
-            composite = self._scoring_engine.compute_score(
+            composite = scoring_engine.compute_score(
                 unit=unit,
                 semantic_score=sem_score,
                 query_time=query_time,
