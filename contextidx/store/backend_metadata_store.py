@@ -115,6 +115,9 @@ class BackendMetadataStore(Store):
     ) -> list[tuple[str, str, str, datetime]]:
         return await self._sqlite.get_graph_edges(unit_id)
 
+    async def get_all_graph_edges(self) -> list[tuple[str, str, str, datetime]]:
+        return await self._sqlite.get_all_graph_edges()
+
     # ── Decay state — delegated to SQLite ──
 
     async def upsert_decay_state(
@@ -137,6 +140,15 @@ class BackendMetadataStore(Store):
         self, unit_ids: list[str]
     ) -> dict[str, tuple[float, datetime, int]]:
         return await self._sqlite.get_decay_states_batch(unit_ids)
+
+    async def upsert_decay_states_batch(
+        self,
+        states: list[tuple[str, float, datetime, int]],
+    ) -> None:
+        await self._sqlite.upsert_decay_states_batch(states)
+
+    async def find_expired_units(self, now: datetime) -> list[str]:
+        return await self._sqlite.find_expired_units(now)
 
     async def increment_reinforcement(self, unit_id: str) -> int:
         return await self._sqlite.increment_reinforcement(unit_id)

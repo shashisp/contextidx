@@ -117,6 +117,35 @@ class Store(ABC):
                 result[uid] = state
         return result
 
+    async def upsert_decay_states_batch(
+        self,
+        states: list[tuple[str, float, datetime, int]],
+    ) -> None:
+        """Upsert multiple decay states in a single operation.
+
+        ``states`` is a list of ``(unit_id, current_score, last_updated, reinforcement_count)``.
+        Subclasses should override with an efficient bulk implementation.
+        The default falls back to sequential ``upsert_decay_state`` calls.
+        """
+        for unit_id, score, last_updated, rc in states:
+            await self.upsert_decay_state(unit_id, score, last_updated, rc)
+
+    @abstractmethod
+    async def find_expired_units(self, now: datetime) -> list[str]:
+        """Return IDs of active units whose ``expires_at`` is <= *now*.
+
+        Implementations must use a SQL index on ``expires_at`` rather than
+        loading all units into Python for a full table scan.
+        """
+
+    @abstractmethod
+    async def get_all_graph_edges(self) -> list[tuple[str, str, str, datetime]]:
+        """Return all edges in the graph as ``(from_id, to_id, relationship, created_at)``.
+
+        Used at startup to bulk-load the in-memory TemporalGraph in a single
+        query instead of one ``get_graph_edges()`` call per active unit.
+        """
+
     @abstractmethod
     async def increment_reinforcement(self, unit_id: str) -> int: ...
 

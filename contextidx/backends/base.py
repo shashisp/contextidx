@@ -38,6 +38,24 @@ class VectorBackend(ABC):
     ) -> str:
         """Persist an embedding vector. Returns the stored ID."""
 
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        """Persist multiple embedding vectors in one operation.
+
+        ``items`` is a list of ``(id, embedding, metadata)`` tuples.
+        Returns the list of stored IDs in the same order.
+
+        The default implementation loops over ``store()`` calls.
+        Backends that support native batch upsert should override this.
+        """
+        ids: list[str] = []
+        for id_, embedding, metadata in items:
+            stored_id = await self.store(id_, embedding, metadata)
+            ids.append(stored_id)
+        return ids
+
     @abstractmethod
     async def search(
         self,

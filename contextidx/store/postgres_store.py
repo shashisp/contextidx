@@ -201,6 +201,12 @@ class PostgresStore(Store):
         )
         return [(r["from_id"], r["to_id"], r["relationship"], r["created_at"]) for r in rows]
 
+    async def get_all_graph_edges(self) -> list[tuple[str, str, str, datetime]]:
+        rows = await self._conn_pool.fetch(
+            "SELECT from_id, to_id, relationship, created_at FROM context_graph"
+        )
+        return [(r["from_id"], r["to_id"], r["relationship"], r["created_at"]) for r in rows]
+
     # ── Decay state ──
 
     async def upsert_decay_state(
@@ -231,6 +237,34 @@ class PostgresStore(Store):
         if row is None:
             return None
         return (float(row["current_score"]), row["last_updated"], row["reinforcement_count"])
+
+    async def upsert_decay_states_batch(
+        self,
+        states: list[tuple[str, float, datetime, int]],
+    ) -> None:
+        if not states:
+            return
+        async with self._conn_pool.acquire() as conn:
+            await conn.executemany(
+                """INSERT INTO decay_state (unit_id, current_score, last_updated, reinforcement_count)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT(unit_id) DO UPDATE SET
+                       current_score = EXCLUDED.current_score,
+                       last_updated = EXCLUDED.last_updated,
+                       reinforcement_count = EXCLUDED.reinforcement_count""",
+                states,
+            )
+
+    async def find_expired_units(self, now: datetime) -> list[str]:
+        rows = await self._conn_pool.fetch(
+            """SELECT id FROM context_units
+               WHERE superseded_by IS NULL
+                 AND archived_at IS NULL
+                 AND expires_at IS NOT NULL
+                 AND expires_at <= $1""",
+            now,
+        )
+        return [r["id"] for r in rows]
 
     async def get_decay_states_batch(
         self, unit_ids: list[str]

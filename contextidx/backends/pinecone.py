@@ -79,6 +79,16 @@ class PineconeBackend(VectorBackend):
         )
         return id
 
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        if not items:
+            return []
+        vectors = [(id_, emb, meta or {}) for id_, emb, meta in items]
+        self._get_index().upsert(vectors=vectors, namespace=self._namespace)
+        return [id_ for id_, _, _ in items]
+
     async def search(
         self,
         query_embedding: list[float],

@@ -172,6 +172,53 @@ class WeaviateBackend(VectorBackend):
         )
         return id
 
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        """Batch upsert grouped by tenant for efficient multi-tenancy."""
+        if not items:
+            return []
+
+        from collections import defaultdict
+        from weaviate.classes.data import DataObject
+
+        # Group items by tenant so we call insert_many once per tenant
+        tenant_groups: dict[str, list[tuple[str, list[float], dict]]] = defaultdict(list)
+        for id_, emb, meta in items:
+            meta = meta or {}
+            tenant = self._scope_to_tenant(meta.get("scope", {}))
+            tenant_groups[tenant].append((id_, emb, meta))
+
+        for tenant, group in tenant_groups.items():
+            col = self._collection.with_tenant(tenant)
+            objects = []
+            for id_, emb, meta in group:
+                scope = meta.get("scope", {})
+                properties = {
+                    "unit_id": id_,
+                    "content": meta.get("content", ""),
+                    "scope": json.dumps(scope) if isinstance(scope, dict) else str(scope),
+                    "source": meta.get("source", "unknown"),
+                    "confidence": meta.get("confidence", 0.8),
+                    "decay_rate": meta.get("decay_rate", 0.023),
+                    "decay_model": meta.get("decay_model", "exponential"),
+                    "version": meta.get("version", 1),
+                    "superseded_by": meta.get("superseded_by", ""),
+                    "created_at": meta.get("created_at", ""),
+                    "expires_at": meta.get("expires_at", ""),
+                    "extra_metadata": json.dumps(
+                        {k: v for k, v in meta.items() if k not in {
+                            "scope", "source", "confidence", "decay_rate", "decay_model",
+                            "version", "superseded_by", "created_at", "expires_at", "content",
+                        }}
+                    ),
+                }
+                objects.append(DataObject(properties=properties, vector=emb))
+            await col.data.insert_many(objects)
+
+        return [id_ for id_, _, _ in items]
+
     async def search(
         self,
         query_embedding: list[float],

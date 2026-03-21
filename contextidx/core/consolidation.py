@@ -6,25 +6,57 @@ retrieval fast.
 
 from __future__ import annotations
 
-import math
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
+from typing import Any
 
 from contextidx.core.context_unit import ContextUnit
 from contextidx.core.temporal_graph import TemporalGraph
+from contextidx.utils.math_utils import cosine_similarity
+
+# Type alias for the ANN search function injected from the backend.
+# Signature: (embedding, top_k, filters) -> list of (id, score) tuples.
+AnnSearchFn = Callable[
+    [list[float], int, dict | None],
+    Coroutine[Any, Any, list[Any]],  # returns list[SearchResult]
+]
+
+_ANN_CANDIDATES = 20  # number of ANN neighbours to fetch per unit
 
 
-def find_redundant_pairs(
+async def find_redundant_pairs(
     units: list[ContextUnit],
     threshold: float = 0.92,
+    ann_search_fn: AnnSearchFn | None = None,
 ) -> list[tuple[str, str]]:
     """Find pairs of units with embedding similarity above *threshold*.
 
     Both units must have embeddings and share the same scope.
     Returns ``(keeper_id, absorbed_id)`` pairs where the keeper is the
     higher-confidence or more recent unit.
+
+    When *ann_search_fn* is provided the function uses ANN pre-filtering:
+    for each unit it fetches the top-``_ANN_CANDIDATES`` approximate nearest
+    neighbours from the backend and applies exact cosine similarity only to
+    those candidates.  This reduces the worst-case complexity from O(N²) to
+    O(N · k) where k = ``_ANN_CANDIDATES``.
+
+    When *ann_search_fn* is ``None`` the original O(N²) exact comparison is
+    used (safe for small corpora and always correct).
     """
+    if ann_search_fn is not None:
+        return await _find_redundant_pairs_ann(units, threshold, ann_search_fn)
+    return _find_redundant_pairs_exact(units, threshold)
+
+
+def _find_redundant_pairs_exact(
+    units: list[ContextUnit],
+    threshold: float,
+) -> list[tuple[str, str]]:
+    """O(N²) exact pairwise comparison — used as fallback or for small N."""
     pairs: list[tuple[str, str]] = []
     n = len(units)
+    seen: set[frozenset[str]] = set()
     for i in range(n):
         if not units[i].embedding:
             continue
@@ -33,10 +65,57 @@ def find_redundant_pairs(
                 continue
             if units[i].scope != units[j].scope:
                 continue
-            sim = _cosine_similarity(units[i].embedding, units[j].embedding)
+            sim = cosine_similarity(units[i].embedding, units[j].embedding)
             if sim >= threshold:
-                keeper, absorbed = _pick_keeper(units[i], units[j])
+                pair_key = frozenset({units[i].id, units[j].id})
+                if pair_key not in seen:
+                    seen.add(pair_key)
+                    keeper, absorbed = _pick_keeper(units[i], units[j])
+                    pairs.append((keeper.id, absorbed.id))
+    return pairs
+
+
+async def _find_redundant_pairs_ann(
+    units: list[ContextUnit],
+    threshold: float,
+    ann_search_fn: AnnSearchFn,
+) -> list[tuple[str, str]]:
+    """O(N·k) ANN pre-filtered comparison."""
+    unit_by_id = {u.id: u for u in units}
+    pairs: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+
+    for unit in units:
+        if not unit.embedding:
+            continue
+        # Fetch approximate nearest neighbours from the backend
+        try:
+            results = await ann_search_fn(
+                unit.embedding,
+                _ANN_CANDIDATES + 1,  # +1 because the unit itself may appear
+                unit.scope or None,
+            )
+        except Exception:
+            continue
+
+        for result in results:
+            candidate_id = result.id
+            if candidate_id == unit.id:
+                continue
+            pair_key = frozenset({unit.id, candidate_id})
+            if pair_key in seen:
+                continue
+            candidate = unit_by_id.get(candidate_id)
+            if candidate is None or not candidate.embedding:
+                continue
+            if unit.scope != candidate.scope:
+                continue
+            sim = cosine_similarity(unit.embedding, candidate.embedding)
+            if sim >= threshold:
+                seen.add(pair_key)
+                keeper, absorbed = _pick_keeper(unit, candidate)
                 pairs.append((keeper.id, absorbed.id))
+
     return pairs
 
 
@@ -77,12 +156,3 @@ def _pick_keeper(a: ContextUnit, b: ContextUnit) -> tuple[ContextUnit, ContextUn
     return b, a
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b) or len(a) == 0:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)

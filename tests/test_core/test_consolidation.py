@@ -39,40 +39,70 @@ def _normalized(vec: list[float]) -> list[float]:
 
 
 class TestFindRedundantPairs:
-    def test_identical_embeddings_are_redundant(self):
+    async def test_identical_embeddings_are_redundant(self):
         emb = _normalized([1.0, 0.0, 0.0])
         u1 = _unit("alpha", embedding=emb, confidence=0.9)
         u2 = _unit("beta", embedding=emb, confidence=0.7)
-        pairs = find_redundant_pairs([u1, u2], threshold=0.90)
+        pairs = await find_redundant_pairs([u1, u2], threshold=0.90)
         assert len(pairs) == 1
         assert pairs[0] == (u1.id, u2.id)
 
-    def test_orthogonal_embeddings_not_redundant(self):
+    async def test_orthogonal_embeddings_not_redundant(self):
         u1 = _unit("alpha", embedding=_normalized([1.0, 0.0, 0.0]))
         u2 = _unit("beta", embedding=_normalized([0.0, 1.0, 0.0]))
-        pairs = find_redundant_pairs([u1, u2], threshold=0.90)
+        pairs = await find_redundant_pairs([u1, u2], threshold=0.90)
         assert len(pairs) == 0
 
-    def test_different_scopes_not_redundant(self):
+    async def test_different_scopes_not_redundant(self):
         emb = _normalized([1.0, 0.0, 0.0])
         u1 = _unit("alpha", embedding=emb, scope={"user_id": "u1"})
         u2 = _unit("beta", embedding=emb, scope={"user_id": "u2"})
-        pairs = find_redundant_pairs([u1, u2], threshold=0.90)
+        pairs = await find_redundant_pairs([u1, u2], threshold=0.90)
         assert len(pairs) == 0
 
-    def test_no_embedding_skipped(self):
+    async def test_no_embedding_skipped(self):
         u1 = _unit("alpha", embedding=_normalized([1.0, 0.0, 0.0]))
         u2 = _unit("beta")  # no embedding
-        pairs = find_redundant_pairs([u1, u2], threshold=0.90)
+        pairs = await find_redundant_pairs([u1, u2], threshold=0.90)
         assert len(pairs) == 0
 
-    def test_keeper_is_higher_confidence(self):
+    async def test_keeper_is_higher_confidence(self):
         emb = _normalized([1.0, 0.0, 0.0])
         u_low = _unit("low", embedding=emb, confidence=0.5)
         u_high = _unit("high", embedding=emb, confidence=0.9)
-        pairs = find_redundant_pairs([u_low, u_high], threshold=0.90)
+        pairs = await find_redundant_pairs([u_low, u_high], threshold=0.90)
         assert pairs[0][0] == u_high.id
         assert pairs[0][1] == u_low.id
+
+    async def test_ann_path_finds_same_pairs(self):
+        """ANN search fn path produces the same results as exact path."""
+        from contextidx.backends.base import SearchResult
+
+        emb = _normalized([1.0, 0.0, 0.0])
+        u1 = _unit("alpha", embedding=emb, confidence=0.9)
+        u2 = _unit("beta", embedding=emb, confidence=0.7)
+
+        async def fake_ann(embedding, top_k, filters):
+            # Return both units as candidates
+            return [SearchResult(id=u1.id, score=1.0), SearchResult(id=u2.id, score=1.0)]
+
+        pairs_exact = await find_redundant_pairs([u1, u2], threshold=0.90)
+        pairs_ann = await find_redundant_pairs([u1, u2], threshold=0.90, ann_search_fn=fake_ann)
+        assert pairs_exact == pairs_ann
+
+    async def test_ann_path_deduplicates_pairs(self):
+        """ANN path does not emit duplicate (a, b) and (b, a) pairs."""
+        from contextidx.backends.base import SearchResult
+
+        emb = _normalized([1.0, 0.0, 0.0])
+        u1 = _unit("alpha", embedding=emb, confidence=0.9)
+        u2 = _unit("beta", embedding=emb, confidence=0.7)
+
+        async def fake_ann(embedding, top_k, filters):
+            return [SearchResult(id=u1.id, score=1.0), SearchResult(id=u2.id, score=1.0)]
+
+        pairs = await find_redundant_pairs([u1, u2], threshold=0.90, ann_search_fn=fake_ann)
+        assert len(pairs) == 1
 
 
 class TestMergeUnits:

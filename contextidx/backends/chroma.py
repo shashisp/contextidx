@@ -76,10 +76,26 @@ class ChromaBackend(VectorBackend):
     ) -> str:
         self._get_collection().upsert(
             ids=[id],
-            embeddings=[embedding],
+            embeddings=[embedding],  # type: ignore[arg-type]
             metadatas=[metadata or {}],
         )
         return id
+
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        if not items:
+            return []
+        ids = [id_ for id_, _, _ in items]
+        embeddings = [emb for _, emb, _ in items]
+        metadatas = [meta or {} for _, _, meta in items]
+        self._get_collection().upsert(
+            ids=ids,
+            embeddings=embeddings,  # type: ignore[arg-type]
+            metadatas=metadatas,
+        )
+        return ids
 
     async def search(
         self,
