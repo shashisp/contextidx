@@ -20,6 +20,7 @@ from contextidx.core.conflict_resolver import ConflictJudgeFn, ConflictResolver
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.core.decay_engine import DecayEngine
 from contextidx.core.embedding import EmbeddingFunction
+from contextidx.core.reranker import OpenAIReranker, RerankerFn
 from contextidx.core.scoring_engine import ScoringEngine
 from contextidx.core.temporal_graph import Relationship, TemporalGraph
 from contextidx.exceptions import (
@@ -36,6 +37,28 @@ from contextidx.utils.pending_buffer import PendingBuffer
 from contextidx.utils.wal import WAL
 
 logger = logging.getLogger("contextidx")
+
+
+def _run_sync(coro):
+    """Run *coro* synchronously, raising a clear error inside async contexts.
+
+    ``asyncio.run()`` raises ``RuntimeError`` when called from a running event
+    loop (Jupyter, FastAPI, LangChain, …).  We detect that case early and give
+    the caller a helpful message instead of an obscure traceback.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        raise RuntimeError(
+            "Cannot call a synchronous ContextIdx wrapper from an async context "
+            "(e.g. inside an async function, Jupyter notebook, or FastAPI handler). "
+            "Use the async variant instead — e.g. 'await idx.astore(...)' rather "
+            "than 'idx.store(...)'."
+        )
+    return asyncio.run(coro)
 
 
 class OpenAIEmbeddingProvider:
@@ -125,6 +148,8 @@ class ContextIdx:
         pending_buffer_type: Literal["memory", "redis"] = "memory",
         redis_url: str | None = None,
         recency_bias: float | None = None,
+        reranker: RerankerFn | None = None,
+        max_graph_edge_nodes: int | None = None,
     ):
         # ── Validate configuration ──
         if half_life_days <= 0:
@@ -186,7 +211,7 @@ class ContextIdx:
             strategy=conflict_strategy,
             conflict_judge_fn=conflict_judge_fn,
         )
-        self._graph = TemporalGraph()
+        self._graph = TemporalGraph(max_edge_nodes=max_graph_edge_nodes)
 
         # Pending buffer: in-memory or Redis-backed
         if pending_buffer_type == "redis":
@@ -212,8 +237,22 @@ class ContextIdx:
             from contextidx.store.backend_metadata_store import BackendMetadataStore
 
             path = internal_store_path or ".contextidx/graph.db"
-            self._store = BackendMetadataStore(backend, graph_store_path=path)
-            logger.info("Using backend as metadata store; SQLite for graph/WAL only")
+            # When a Postgres DSN is provided alongside a metadata-capable backend,
+            # use PostgresStore for the graph/WAL tables so data survives pod restarts.
+            graph_store: Store | None = None
+            if internal_store_dsn:
+                from contextidx.store.postgres_store import PostgresStore
+                graph_store = PostgresStore(dsn=internal_store_dsn)
+                logger.info(
+                    "Using backend as metadata store; PostgresStore for graph/WAL"
+                )
+            else:
+                logger.info(
+                    "Using backend as metadata store; SQLite for graph/WAL only"
+                )
+            self._store = BackendMetadataStore(
+                backend, graph_store=graph_store, graph_store_path=path
+            )
         else:
             path = internal_store_path or ".contextidx/meta.db"
             self._store = SQLiteStore(path=path)
@@ -251,8 +290,9 @@ class ContextIdx:
                 flush_interval=batch_flush_interval,
             )
 
-        # Re-ranking client — initialized lazily on first use and reused thereafter
-        self._rerank_client: object | None = None
+        # Re-ranking — use the injected reranker or lazy-init OpenAIReranker on first use
+        self._reranker: RerankerFn | None = reranker
+        self._rerank_client: OpenAIReranker | None = None
 
     # ── Lifecycle ──
 
@@ -561,7 +601,7 @@ class ContextIdx:
         **kwargs,
     ) -> str:
         """Store a context unit (sync wrapper)."""
-        return asyncio.run(
+        return _run_sync(
             self.astore(
                 content=content,
                 scope=scope,
@@ -696,10 +736,18 @@ class ContextIdx:
 
         # 4b. Graph expansion: follow RELATES_TO edges from top candidates
         # to pull in neighboring context that vector search may have missed.
+        # When max_graph_edge_nodes is set, a node's edges may have been evicted
+        # from the in-memory graph; fall back to the store for those nodes.
         expansion_ids: set[str] = set()
         filtered_id_set = {u.id for u, _, _ in filtered}
         for unit, _, _ in filtered[:top_k]:
             related = self._graph.get_related(unit.id)
+            if not related and self._graph.was_evicted(unit.id):
+                # In-memory edges evicted — reload from store for this node
+                db_edges = await self._store.get_graph_edges(unit.id)
+                for from_id, to_id, rel, created_at in db_edges:
+                    if rel == "relates_to":
+                        related.append(to_id if from_id == unit.id else from_id)
             for rid in related:
                 if rid not in filtered_id_set and rid not in seen_ids:
                     expansion_ids.add(rid)
@@ -769,65 +817,27 @@ class ContextIdx:
         scored: list[tuple[ContextUnit, float, float]],
         top_k: int,
     ) -> list[tuple[ContextUnit, float, float]]:
-        """Re-rank candidates using gpt-4o-mini for relevance scoring.
+        """Re-rank candidates using the configured reranker.
 
-        Takes the top 2*top_k candidates and asks the LLM to score each on
-        a 0-10 relevance scale. Falls back to original ordering on error.
+        Uses the injected ``reranker`` if provided; otherwise lazy-inits an
+        :class:`~contextidx.core.reranker.OpenAIReranker`.  Falls back to
+        the original ordering on any error.
         """
-        rerank_pool = scored[: top_k * 2]
-        if len(rerank_pool) <= 1:
+        if len(scored) <= 1:
             return scored
 
-        if self._rerank_client is None:
-            try:
-                from openai import AsyncOpenAI
-                self._rerank_client = AsyncOpenAI()
-            except ImportError:
-                logger.warning("openai not installed; skipping LLM re-rank")
-                return scored
+        reranker = self._reranker
+        if reranker is None:
+            if self._rerank_client is None:
+                try:
+                    self._rerank_client = OpenAIReranker()
+                except ImportError:
+                    logger.warning("openai not installed; skipping LLM re-rank")
+                    return scored
+            reranker = self._rerank_client
 
         try:
-            numbered = "\n".join(
-                f"[{i}] {u.content[:300]}" for i, (u, _, _) in enumerate(rerank_pool)
-            )
-            resp = await self._rerank_client.chat.completions.create(  # type: ignore[union-attr]
-                model="gpt-4o-mini",
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a relevance judge. Given a query and numbered text passages, "
-                            "rate each passage's relevance to the query on a scale of 0-10. "
-                            "Output ONLY a JSON array of objects with 'index' and 'score' keys. "
-                            "Example: [{\"index\":0,\"score\":8},{\"index\":1,\"score\":3}]"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Query: {query}\n\nPassages:\n{numbered}",
-                    },
-                ],
-            )
-            import json as _json
-
-            raw = resp.choices[0].message.content or "[]"
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            rankings = _json.loads(raw)
-            score_map: dict[int, float] = {r["index"]: float(r["score"]) for r in rankings}
-
-            reranked: list[tuple[ContextUnit, float, float]] = []
-            for i, (unit, composite, decay) in enumerate(rerank_pool):
-                llm_score = score_map.get(i, 5.0) / 10.0
-                blended = 0.4 * composite + 0.6 * llm_score
-                reranked.append((unit, blended, decay))
-            reranked.sort(key=lambda x: x[1], reverse=True)
-
-            remaining = scored[top_k * 2 :]
-            return reranked + remaining
-
+            return await reranker(query, scored, top_k)
         except Exception:
             logger.warning("LLM re-rank failed; using original scores", exc_info=True)
             return scored
@@ -843,7 +853,7 @@ class ContextIdx:
         **kwargs,
     ) -> list[ContextUnit]:
         """Retrieve temporally-scored context units (sync wrapper)."""
-        return asyncio.run(
+        return _run_sync(
             self.aretrieve(
                 query=query,
                 scope=scope,
@@ -878,7 +888,7 @@ class ContextIdx:
 
     def supersede(self, new_id: str, old_id: str) -> None:
         """Sync wrapper for :meth:`asupersede`."""
-        asyncio.run(self.asupersede(new_id, old_id))
+        _run_sync(self.asupersede(new_id, old_id))
 
     # ── Graph linking ──
 
@@ -922,7 +932,7 @@ class ContextIdx:
 
     def clear(self, scope: dict[str, str]) -> int:
         """Sync wrapper for :meth:`aclear`."""
-        return asyncio.run(self.aclear(scope))
+        return _run_sync(self.aclear(scope))
 
     # ── Reinforce ──
 
@@ -939,7 +949,7 @@ class ContextIdx:
 
     def reinforce(self, unit_id: str) -> None:
         """Sync wrapper for areinforce."""
-        asyncio.run(self.areinforce(unit_id))
+        _run_sync(self.areinforce(unit_id))
 
     # ── Lineage ──
 
@@ -1062,10 +1072,38 @@ class ContextIdx:
 
     # ── State Path ──
 
+    async def _acquire_leader_lock(self) -> bool:
+        """Try to acquire a distributed state-path leader lock via Redis.
+
+        Returns ``True`` when this instance should run the tick:
+        - Always ``True`` for non-Redis deployments (single-instance assumed).
+        - For Redis deployments, only ``True`` when the ``SET NX EX`` succeeds,
+          meaning no other instance already holds the lock.
+
+        The lock TTL is ``2 × state_path_interval`` so a slow tick never blocks
+        the next one from running on another instance after a restart.
+        """
+        try:
+            from contextidx.utils.redis_pending_buffer import RedisPendingBuffer
+        except ImportError:
+            return True  # redis not installed — single-instance mode
+
+        if not isinstance(self._pending, RedisPendingBuffer):
+            return True  # No Redis — single-instance mode, always leader
+
+        ttl = max(1, int(self._state_path_interval * 2))
+        acquired = await self._pending._redis.set(
+            "ctxidx:state_path_leader", "1", nx=True, ex=ttl
+        )
+        if acquired is None:
+            logger.debug("State path: another instance holds the leader lock; skipping tick")
+        return acquired is not None
+
     async def _state_path_loop(self) -> None:
         while self._running:
             try:
-                await self._state_path_tick()
+                if await self._acquire_leader_lock():
+                    await self._state_path_tick()
             except (StoreError, BackendError) as exc:
                 logger.exception("State path tick error: %s", exc)
             except Exception:

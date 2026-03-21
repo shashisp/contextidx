@@ -25,17 +25,20 @@ class BackendMetadataStore(Store):
     """Delegates ContextUnit CRUD to the vector backend.
 
     Graph, WAL, decay-state and checkpoint operations are handled by an
-    internal ``SQLiteStore`` that is auto-provisioned.
+    injected ``graph_store`` (defaults to an auto-provisioned ``SQLiteStore``).
+    Pass a ``PostgresStore`` as *graph_store* for Kubernetes or other
+    deployments that cannot rely on a persistent local filesystem.
     """
 
     def __init__(
         self,
         backend: VectorBackend,
         *,
+        graph_store: Store | None = None,
         graph_store_path: str | Path = ".contextidx/graph.db",
     ):
         self._backend = backend
-        self._sqlite = SQLiteStore(path=graph_store_path)
+        self._sqlite: Store = graph_store or SQLiteStore(path=graph_store_path)
         self._units_cache: dict[str, ContextUnit] = {}
 
     async def initialize(self) -> None:
