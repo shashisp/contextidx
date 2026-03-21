@@ -251,6 +251,9 @@ class ContextIdx:
                 flush_interval=batch_flush_interval,
             )
 
+        # Re-ranking client — initialized lazily on first use and reused thereafter
+        self._rerank_client: object | None = None
+
     # ── Lifecycle ──
 
     async def __aenter__(self) -> ContextIdx:
@@ -468,7 +471,7 @@ class ContextIdx:
             payload=unit.model_dump(mode="json"),
         )
 
-        self._pending.add(unit)
+        await self._pending.add(unit)
 
         existing = await self._store.find_units_in_scope(scope)
         superseded_units: list = []
@@ -625,7 +628,7 @@ class ContextIdx:
             )
 
         # 3. Collect all IDs we need, then batch-load from the store
-        pending = self._pending.get(scope)
+        pending = await self._pending.get(scope)
         pending_ids = list({pu.id for pu in pending})
         result_ids = [sr.id for sr in raw_results if sr.id not in set(pending_ids)]
 
@@ -773,18 +776,19 @@ class ContextIdx:
         if len(rerank_pool) <= 1:
             return scored
 
-        try:
-            from openai import AsyncOpenAI
-        except ImportError:
-            logger.warning("openai not installed; skipping LLM re-rank")
-            return scored
+        if self._rerank_client is None:
+            try:
+                from openai import AsyncOpenAI
+                self._rerank_client = AsyncOpenAI()
+            except ImportError:
+                logger.warning("openai not installed; skipping LLM re-rank")
+                return scored
 
         try:
-            client = AsyncOpenAI()
             numbered = "\n".join(
                 f"[{i}] {u.content[:300]}" for i, (u, _, _) in enumerate(rerank_pool)
             )
-            resp = await client.chat.completions.create(
+            resp = await self._rerank_client.chat.completions.create(  # type: ignore[union-attr]
                 model="gpt-4o-mini",
                 temperature=0,
                 messages=[
@@ -898,12 +902,15 @@ class ContextIdx:
         units = await self._store.find_units_in_scope(
             scope, include_superseded=True, include_archived=True,
         )
+        deleted_ids: set[str] = set()
         for unit in units:
             try:
                 await self._backend.delete(unit.id)
             except Exception:
                 logger.debug("Backend delete failed for %s (may not exist)", unit.id)
             await self._store.delete_unit(unit.id)
+            deleted_ids.add(unit.id)
+        self._graph.remove_units(deleted_ids)
         if hasattr(self._pending, "clear_scope"):
             result = self._pending.clear_scope(scope)
             if asyncio.iscoroutine(result):

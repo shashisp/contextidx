@@ -83,3 +83,55 @@ class TestGetEdgesFor:
         g.add_edge("c", "a", "relates_to", now)
         edges = g.get_edges_for("a")
         assert len(edges) == 2
+
+
+class TestRemoveUnits:
+    def test_removes_outgoing_edges(self):
+        g = TemporalGraph()
+        g.add_edge("a", "b", "supersedes", _now())
+        g.remove_units({"a"})
+        assert g.get_superseded("a") == []
+
+    def test_removes_incoming_edges(self):
+        g = TemporalGraph()
+        g.add_edge("a", "b", "supersedes", _now())
+        g.remove_units({"b"})
+        assert g.find_superseded_by("b") is None
+
+    def test_purges_dangling_references(self):
+        """After removing 'b', 'a' should have no outgoing edge to 'b'."""
+        g = TemporalGraph()
+        g.add_edge("a", "b", "relates_to", _now())
+        g.remove_units({"b"})
+        assert "b" not in g.get_related("a")
+
+    def test_remove_multiple_units(self):
+        g = TemporalGraph()
+        g.add_edge("a", "b", "supersedes", _now())
+        g.add_edge("b", "c", "version_of", _now())
+        g.remove_units({"a", "b"})
+        assert g.get_superseded("a") == []
+        assert g.find_superseded_by("b") is None
+        # 'c' still exists; its incoming VERSION_OF from 'b' is gone
+        assert g.get_lineage("c") == ["c"]
+
+    def test_remove_nonexistent_unit_is_safe(self):
+        g = TemporalGraph()
+        g.remove_units({"does_not_exist"})  # should not raise
+
+
+class TestClear:
+    def test_clear_removes_all_edges(self):
+        g = TemporalGraph()
+        g.add_edge("a", "b", "supersedes", _now())
+        g.add_edge("c", "d", "relates_to", _now())
+        g.clear()
+        assert g.get_superseded("a") == []
+        assert g.get_related("c") == []
+
+    def test_clear_then_add_works(self):
+        g = TemporalGraph()
+        g.add_edge("a", "b", "supersedes", _now())
+        g.clear()
+        g.add_edge("x", "y", "relates_to", _now())
+        assert "y" in g.get_related("x")
