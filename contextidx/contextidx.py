@@ -323,7 +323,7 @@ class ContextIdx:
     )
 
     _retry_embedding = retry(
-        stop=stop_after_attempt(6),
+        stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=2, min=2, max=120),
         retry=_retry_rate_limit(),
         reraise=True,
@@ -464,11 +464,13 @@ class ContextIdx:
         else:
             unit.embedding = await self._embed(content)
 
+        wal_payload = unit.model_dump(mode="json")
+        wal_payload.pop("embedding", None)  # embeddings are re-computed on WAL replay
         wal_seq = await self._wal.append(
             unit_id=unit.id,
             operation="store",
             store_target="both",
-            payload=unit.model_dump(mode="json"),
+            payload=wal_payload,
         )
 
         await self._pending.add(unit)
@@ -1110,7 +1112,7 @@ class ContextIdx:
         from contextidx.core.consolidation import find_redundant_pairs, merge_units
 
         units = await self._store.find_active_units()
-        pairs = find_redundant_pairs(units)
+        pairs = await find_redundant_pairs(units, ann_search_fn=self._backend.search)
         merged = 0
         for keeper_id, absorbed_id in pairs:
             keeper = await self._store.get_unit(keeper_id)
@@ -1142,22 +1144,25 @@ class ContextIdx:
     async def _decay_tick(self) -> None:
         """Recalculate decay scores for all active units."""
         units = await self._store.find_active_units()
+        if not units:
+            return
         now = datetime.now(timezone.utc)
+        unit_ids = [u.id for u in units]
+        decay_states = await self._store.get_decay_states_batch(unit_ids)
+        batch: list[tuple[str, float, datetime, int]] = []
         for unit in units:
-            state = await self._store.get_decay_state(unit.id)
+            state = decay_states.get(unit.id)
             rc = state[2] if state else 0
             score = self._decay_engine.compute_decay(unit, now, rc)
-            await self._store.upsert_decay_state(unit.id, score, now, rc)
+            batch.append((unit.id, score, now, rc))
+        await self._store.upsert_decay_states_batch(batch)
 
     async def _expiry_archive(self) -> None:
-        """Archive expired step-decay units."""
-        units = await self._store.find_active_units()
+        """Archive expired units using an indexed SQL query."""
         now = datetime.now(timezone.utc)
-        for unit in units:
-            if unit.is_expired_at(now):
-                await self._store.update_unit(
-                    unit.id, {"archived_at": now.isoformat()}
-                )
+        expired_ids = await self._store.find_expired_units(now)
+        for unit_id in expired_ids:
+            await self._store.update_unit(unit_id, {"archived_at": now.isoformat()})
 
     # ── WAL Replay ──
 
@@ -1191,14 +1196,10 @@ class ContextIdx:
     # ── Graph Loading ──
 
     async def _load_graph(self) -> None:
-        """Load all graph edges from the store into memory."""
-        from contextidx.core.temporal_graph import Edge, Relationship
-
-        units = await self._store.find_active_units()
-        for unit in units:
-            edges = await self._store.get_graph_edges(unit.id)
-            for from_id, to_id, rel, created_at in edges:
-                self._graph.add_edge(from_id, to_id, rel, created_at)
+        """Bulk-load all graph edges from the store into memory (single query)."""
+        all_edges = await self._store.get_all_graph_edges()
+        for from_id, to_id, rel, created_at in all_edges:
+            self._graph.add_edge(from_id, to_id, rel, created_at)
 
     # ── Helpers ──
 

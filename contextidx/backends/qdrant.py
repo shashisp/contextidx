@@ -91,6 +91,22 @@ class QdrantBackend(VectorBackend):
         )
         return id
 
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        if not items:
+            return []
+        points = [
+            PointStruct(id=id_, vector=emb, payload=meta or {})
+            for id_, emb, meta in items
+        ]
+        await self._get_client().upsert(
+            collection_name=self._collection,
+            points=points,
+        )
+        return [id_ for id_, _, _ in items]
+
     async def search(
         self,
         query_embedding: list[float],

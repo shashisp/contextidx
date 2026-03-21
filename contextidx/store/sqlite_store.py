@@ -205,6 +205,16 @@ class SQLiteStore(Store):
             for r in rows
         ]
 
+    async def get_all_graph_edges(self) -> list[tuple[str, str, str, datetime]]:
+        cursor = await self._conn.execute(
+            "SELECT from_id, to_id, relationship, created_at FROM context_graph"
+        )
+        rows = await cursor.fetchall()
+        return [
+            (r["from_id"], r["to_id"], r["relationship"], _str_to_dt(r["created_at"]))  # type: ignore[misc]
+            for r in rows
+        ]
+
     # ── Decay state ──
 
     async def upsert_decay_state(
@@ -236,6 +246,35 @@ class SQLiteStore(Store):
         if row is None:
             return None
         return (row["current_score"], _str_to_dt(row["last_updated"]), row["reinforcement_count"])  # type: ignore[return-value]
+
+    async def upsert_decay_states_batch(
+        self,
+        states: list[tuple[str, float, datetime, int]],
+    ) -> None:
+        if not states:
+            return
+        await self._conn.executemany(
+            """INSERT INTO decay_state (unit_id, current_score, last_updated, reinforcement_count)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(unit_id) DO UPDATE SET
+                   current_score = excluded.current_score,
+                   last_updated = excluded.last_updated,
+                   reinforcement_count = excluded.reinforcement_count""",
+            [(uid, score, _dt_to_str(ts), rc) for uid, score, ts, rc in states],
+        )
+        await self._conn.commit()
+
+    async def find_expired_units(self, now: datetime) -> list[str]:
+        cursor = await self._conn.execute(
+            """SELECT id FROM context_units
+               WHERE superseded_by IS NULL
+                 AND archived_at IS NULL
+                 AND expires_at IS NOT NULL
+                 AND expires_at <= ?""",
+            (_dt_to_str(now),),
+        )
+        rows = await cursor.fetchall()
+        return [r["id"] for r in rows]
 
     async def get_decay_states_batch(
         self, unit_ids: list[str]

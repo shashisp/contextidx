@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import math
 import re
 from enum import Enum
 from typing import Literal, Protocol, runtime_checkable
 
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
+from contextidx.utils.math_utils import cosine_similarity
 
 _VERB_PAIRS: list[tuple[str, str]] = [
     (r"\bprefers\s+", r"\bdoes\s+not\s+prefer\s+"),
@@ -133,7 +133,7 @@ class ConflictResolver:
             if existing.id == new_unit.id:
                 continue
 
-            sim = _cosine_similarity(new_unit.embedding, existing.embedding)
+            sim = cosine_similarity(new_unit.embedding, existing.embedding)
             if sim >= self._semantic_threshold:
                 conflicts.append(existing)
         return conflicts
@@ -267,12 +267,3 @@ class ConflictResolver:
         return high_overlap and (a_has_not != b_has_not)
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b) or len(a) == 0:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)

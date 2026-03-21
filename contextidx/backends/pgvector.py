@@ -120,6 +120,30 @@ class PGVectorBackend(VectorBackend):
             await conn.commit()
         return id
 
+    async def store_batch(
+        self,
+        items: list[tuple[str, list[float], dict | None]],
+    ) -> list[str]:
+        if not items:
+            return []
+        rows = [
+            (id_, _to_pg_vector(emb), json.dumps(meta or {}), _extract_content(meta))
+            for id_, emb, meta in items
+        ]
+        async with self._get_pool().connection() as conn:
+            await conn.executemany(
+                f"""INSERT INTO {self._table} (id, embedding, metadata, content)
+                    VALUES (%s, %s::vector, %s::jsonb, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        embedding = EXCLUDED.embedding,
+                        metadata = EXCLUDED.metadata,
+                        content = EXCLUDED.content""",
+                rows,
+            )
+            await conn.commit()
+        return [id_ for id_, _, _, _ in rows]
+
+
     async def search(
         self,
         query_embedding: list[float],
