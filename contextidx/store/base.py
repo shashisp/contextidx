@@ -177,6 +177,29 @@ class Store(ABC):
         Returns the number of rows removed.
         """
 
+    async def get_pending_wal_count(self) -> int:
+        """Return the number of pending (unapplied) WAL entries.
+
+        Used by the circuit-breaker in ``astore()`` to check whether the WAL
+        has grown beyond the configured limit.  The default implementation
+        counts entries from ``get_pending_wal()``; subclasses should override
+        with a direct ``SELECT COUNT(*)`` for efficiency.
+        """
+        return len(await self.get_pending_wal())
+
+    async def drop_stale_wal(self, before: datetime) -> int:
+        """Drop *pending* WAL entries older than *before* (unrecoverable).
+
+        Unlike ``compact_wal`` which only removes applied entries, this method
+        removes entries that have been waiting too long and are considered
+        permanently unrecoverable (e.g. backend has been unavailable for days).
+        Implementations should log a warning for every entry dropped.
+
+        Returns the number of entries removed.  The default returns 0;
+        subclasses with SQL stores should override with a targeted DELETE.
+        """
+        return 0
+
     # ── Reconciliation ──
 
     @abstractmethod
