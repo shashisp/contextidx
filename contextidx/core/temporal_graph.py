@@ -109,6 +109,22 @@ class TemporalGraph:
         inc = [e for e in self._incoming.get(unit_id, []) if e not in out]
         return out + inc
 
+    def remove_units(self, unit_ids: set[str]) -> None:
+        """Remove all edges involving any of *unit_ids* from the graph."""
+        for uid in unit_ids:
+            self._outgoing.pop(uid, None)
+            self._incoming.pop(uid, None)
+        # Also purge dangling references in remaining adjacency lists
+        for uid in list(self._outgoing):
+            self._outgoing[uid] = [e for e in self._outgoing[uid] if e.to_id not in unit_ids]
+        for uid in list(self._incoming):
+            self._incoming[uid] = [e for e in self._incoming[uid] if e.from_id not in unit_ids]
+
+    def clear(self) -> None:
+        """Remove all edges from the graph."""
+        self._outgoing.clear()
+        self._incoming.clear()
+
     def load_edges(self, edges: list[Edge]) -> None:
         """Bulk-load edges (e.g. from database on startup)."""
         for e in edges:

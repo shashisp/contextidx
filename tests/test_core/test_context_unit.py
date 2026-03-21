@@ -88,3 +88,17 @@ class TestContextUnit:
     def test_decay_rate_from_half_life(self):
         rate = ContextUnit.decay_rate_from_half_life(30.0)
         assert abs(rate - 0.023104906) < 0.001
+
+    def test_age_days_freshly_created(self):
+        unit = ContextUnit(content="x")
+        assert unit.age_days >= 0.0
+        assert unit.age_days < 0.01  # well under 1 second old
+
+    def test_age_days_old_unit(self):
+        past = datetime.now(timezone.utc) - timedelta(days=5)
+        unit = ContextUnit(content="x", timestamp=past)
+        assert 4.9 < unit.age_days < 5.1
+
+    def test_age_days_is_float(self):
+        unit = ContextUnit(content="x")
+        assert isinstance(unit.age_days, float)

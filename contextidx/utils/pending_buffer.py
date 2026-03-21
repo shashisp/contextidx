@@ -24,14 +24,14 @@ class PendingBuffer:
         self._max = max_units_per_scope
         self._buffer: dict[str, list[tuple[ContextUnit, datetime]]] = {}
 
-    def add(self, unit: ContextUnit) -> None:
+    async def add(self, unit: ContextUnit) -> None:
         key = _hash_scope(unit.scope)
         bucket = self._buffer.setdefault(key, [])
         bucket.append((unit, datetime.now(timezone.utc)))
         if len(bucket) > self._max:
             bucket.pop(0)
 
-    def get(self, scope: dict[str, str]) -> list[ContextUnit]:
+    async def get(self, scope: dict[str, str]) -> list[ContextUnit]:
         """Return non-expired pending units for *scope*."""
         key = _hash_scope(scope)
         bucket = self._buffer.get(key, [])

@@ -30,6 +30,11 @@ class ContextUnit(BaseModel):
     expires_at: datetime | None = None
 
     @property
+    def age_days(self) -> float:
+        """Number of days since this unit was created."""
+        return (datetime.now(timezone.utc) - self.timestamp).total_seconds() / 86400
+
+    @property
     def is_superseded(self) -> bool:
         return self.superseded_by is not None
 

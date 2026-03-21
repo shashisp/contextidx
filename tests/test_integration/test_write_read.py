@@ -182,3 +182,95 @@ class TestDiff:
     async def test_diff_excludes_old(self, idx):
         results = await idx.adiff(scope={"user_id": "u999"}, since="1d")
         assert len(results) == 0
+
+
+class TestAclearGraphConsistency:
+    """Bug fix: aclear() must remove stale edges from the in-memory TemporalGraph."""
+
+    async def test_aclear_removes_graph_edges(self, idx):
+        scope = {"user_id": "clear_test"}
+        uid = await idx.astore(
+            content="fact to be cleared",
+            scope=scope,
+            embedding=_emb(9.0),
+        )
+        # Verify the unit's edges are in the graph before clearing
+        # (store two related units so an edge exists)
+        uid2 = await idx.astore(
+            content="related fact",
+            scope=scope,
+            embedding=_emb(9.1),
+        )
+        await idx.alink_related(uid, uid2)
+
+        assert len(idx._graph.get_related(uid)) > 0
+
+        await idx.aclear(scope)
+
+        # After clear, graph should have no edges for the deleted units
+        assert idx._graph.get_related(uid) == []
+        assert idx._graph.get_related(uid2) == []
+
+    async def test_aclear_does_not_affect_other_scopes(self, idx):
+        scope_a = {"user_id": "scope_a"}
+        scope_b = {"user_id": "scope_b"}
+
+        uid_a = await idx.astore(
+            content="fact in scope a",
+            scope=scope_a,
+            embedding=_emb(10.0),
+        )
+        uid_b = await idx.astore(
+            content="fact in scope b",
+            scope=scope_b,
+            embedding=_emb(10.1),
+        )
+
+        await idx.aclear(scope_a)
+
+        # scope_b unit should still exist in store
+        unit = await idx._store.get_unit(uid_b)
+        assert unit is not None
+
+
+class TestRerankClientReuse:
+    """Bug fix: re-ranking client must be instantiated once, not per call."""
+
+    async def test_rerank_client_starts_none(self, idx):
+        assert idx._rerank_client is None
+
+    async def test_rerank_client_cached_after_first_use(self, idx):
+        """After the first rerank attempt, _rerank_client is set and reused."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        fake_client = MagicMock()
+        fake_client.chat = MagicMock()
+        fake_client.chat.completions = MagicMock()
+        fake_client.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content='[{"index":0,"score":8}]'))]
+            )
+        )
+
+        scope = {"user_id": "rerank_test"}
+        for i in range(3):
+            await idx.astore(
+                content=f"fact {i}",
+                scope=scope,
+                embedding=_emb(11.0 + i * 0.1),
+            )
+
+        with patch("openai.AsyncOpenAI", return_value=fake_client) as mock_cls:
+            # First retrieval — should construct the client once
+            await idx.aretrieve(
+                query="test", scope=scope, top_k=1, rerank=True,
+                query_embedding=_emb(11.0),
+            )
+            assert mock_cls.call_count == 1
+
+            # Second retrieval — client already cached, must NOT construct again
+            await idx.aretrieve(
+                query="test", scope=scope, top_k=1, rerank=True,
+                query_embedding=_emb(11.0),
+            )
+            assert mock_cls.call_count == 1  # still 1, not 2
