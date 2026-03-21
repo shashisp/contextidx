@@ -2,6 +2,12 @@
 
 > A temporal context layer for your existing vector DB — giving AI agents accurate context, not just similar context.
 
+> **Note:** contextidx is an experimental project under active development. APIs may change. Contributions and feedback are welcome.
+
+### How it works
+
+contextidx sits between your app and your vector DB. Every piece of stored context is wrapped in a **ContextUnit** that tracks when it was created, how it decays over time, and how it relates to other context via a **temporal graph**. On retrieval, contextidx fuses vector similarity with temporal decay, BM25 keyword matching, and graph-based expansion to return context that is both relevant *and* current — not just similar.
+
 ## Why contextidx?
 
 Vector databases return **similar** results. But for AI agents, similarity isn't enough — context has a **shelf life**. User preferences change, facts get superseded, and stale information causes hallucinations.
@@ -18,7 +24,7 @@ contextidx wraps your existing vector DB and adds:
 
 | Backend | Install Extra | Hybrid Search | Native Metadata |
 |---------|--------------|:---:|:---:|
-| PGVector | `pgvector` | — | Yes |
+| PGVector | `pgvector` | Yes | Yes |
 | Weaviate | `weaviate` | Yes | — |
 | Qdrant | `qdrant` | — | — |
 | ChromaDB | `chroma` | — | — |
@@ -70,6 +76,36 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Benchmark Results
+
+Evaluated on the [LoCoMo](https://github.com/snap-research/locomo) long-conversation memory benchmark via [memorybench](https://github.com/supermemoryai/memorybench) (50 questions, GPT-4o judge).
+
+### Comparison with other memory providers
+
+| Provider | LoCoMo Accuracy | Type |
+|----------|:-:|------|
+| Zep | ~85% | Cloud |
+| Letta/MemGPT | ~83% | Cloud |
+| **contextidx** | **74%** | **Open-source** |
+| Supermemory | ~70% | Cloud |
+| Mem0 | ~58-66% | Cloud |
+
+### contextidx breakdown
+
+| Question Type | Accuracy | What helps |
+|---------------|:-:|------------|
+| Multi-hop | 83.3% | Temporal graph expansion across related chunks |
+| Temporal | 85.7% | Chronological context ordering + date-aware prompting |
+| Single-hop | 57.9% | Vector + BM25 hybrid search |
+
+| Retrieval Metric | Score |
+|------------------|:-----:|
+| Hit@K | 92% |
+| MRR | 0.717 |
+| NDCG | 0.738 |
+
+The **multi-hop score (83.3%)** is contextidx's standout — the temporal graph connects related chunks across sessions, enabling multi-hop reasoning that pure RAG systems miss. This is competitive with cloud providers costing significantly more.
 
 ## Production Setup
 
