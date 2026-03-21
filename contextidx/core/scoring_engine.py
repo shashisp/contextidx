@@ -25,7 +25,12 @@ class ScoringEngine:
     backends produce identical rankings to the v0.1 engine.
     """
 
-    def __init__(self, weights: dict[str, float] | None = None):
+    def __init__(
+        self,
+        weights: dict[str, float] | None = None,
+        recency_half_life_days: float = 30.0,
+        reinforcement_saturation: int = 20,
+    ):
         self._weights = dict(DEFAULT_WEIGHTS)
         if weights:
             self._weights.update(weights)
@@ -34,6 +39,8 @@ class ScoringEngine:
         if not math.isclose(total, 1.0, abs_tol=1e-6):
             for k in self._weights:
                 self._weights[k] /= total
+        self._recency_half_life_days = recency_half_life_days
+        self._reinforcement_saturation = reinforcement_saturation
 
     @property
     def weights(self) -> dict[str, float]:
@@ -61,8 +68,12 @@ class ScoringEngine:
         Returns:
             Composite score in [0, 1].
         """
-        recency = self._recency_score(unit.timestamp, query_time)
-        reinforcement = self._reinforcement_score(reinforcement_count)
+        recency = self._recency_score(
+            unit.timestamp, query_time, self._recency_half_life_days
+        )
+        reinforcement = self._reinforcement_score(
+            reinforcement_count, self._reinforcement_saturation
+        )
 
         signals = {
             "semantic": semantic_score,
@@ -90,12 +101,14 @@ class ScoringEngine:
         return {k: v / total for k, v in remaining.items()}
 
     @staticmethod
-    def _recency_score(created_at: datetime, query_time: datetime) -> float:
-        """Exponential recency with 30-day half-life."""
+    def _recency_score(
+        created_at: datetime, query_time: datetime, half_life_days: float = 30.0
+    ) -> float:
+        """Exponential recency decay with configurable half-life."""
         age_days = (query_time - created_at).total_seconds() / SECONDS_PER_DAY
         if age_days < 0:
             return 1.0
-        return math.exp(-age_days * math.log(2) / 30.0)
+        return math.exp(-age_days * math.log(2) / half_life_days)
 
     @staticmethod
     def _reinforcement_score(reinforcement_count: int, saturation: int = 20) -> float:
@@ -124,9 +137,15 @@ class ScoringEngine:
         if n == 0:
             return []
 
-        recency = [self._recency_score(u.timestamp, query_time) for u in units]
+        recency = [
+            self._recency_score(u.timestamp, query_time, self._recency_half_life_days)
+            for u in units
+        ]
         confidences = [u.confidence for u in units]
-        reinforcement = [self._reinforcement_score(rc) for rc in reinforcement_counts]
+        reinforcement = [
+            self._reinforcement_score(rc, self._reinforcement_saturation)
+            for rc in reinforcement_counts
+        ]
         bm25 = bm25_scores if bm25_scores is not None else [0.0] * n
 
         has_bm25 = bm25_scores is not None

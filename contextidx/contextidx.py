@@ -16,6 +16,7 @@ from tenacity import (
 )
 
 from contextidx.backends.base import VectorBackend
+from contextidx.config import ContextIdxConfig
 from contextidx.core.conflict_resolver import ConflictJudgeFn, ConflictResolver
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.core.decay_engine import DecayEngine
@@ -29,7 +30,7 @@ from contextidx.exceptions import (
     EmbeddingError,
     StoreError,
 )
-from contextidx.store.base import Store
+from contextidx.store.base import Store, validate_scope_keys
 from contextidx.store.sqlite_store import SQLiteStore
 from contextidx.utils.batch_writer import BatchWriter
 from contextidx.utils.conflict_queue import ConflictQueue
@@ -150,6 +151,7 @@ class ContextIdx:
         recency_bias: float | None = None,
         reranker: RerankerFn | None = None,
         max_graph_edge_nodes: int | None = None,
+        config: ContextIdxConfig | None = None,
     ):
         # ── Validate configuration ──
         if half_life_days <= 0:
@@ -199,6 +201,12 @@ class ContextIdx:
                 f"recency_bias must be in [0, 1], got {recency_bias}"
             )
 
+        self._cfg = config or ContextIdxConfig()
+        # scoring_weights kwarg takes precedence over config.scoring_weights
+        _weights = dict(self._cfg.scoring_weights)
+        if scoring_weights:
+            _weights.update(scoring_weights)
+
         self._backend = backend
         self._decay_model = decay_model
         self._decay_rate = ContextUnit.decay_rate_from_half_life(half_life_days)
@@ -206,7 +214,11 @@ class ContextIdx:
         self._conflict_detection = conflict_detection
 
         self._decay_engine = DecayEngine()
-        self._scoring_engine = ScoringEngine(weights=scoring_weights)
+        self._scoring_engine = ScoringEngine(
+            weights=_weights or None,
+            recency_half_life_days=self._cfg.recency_half_life_days,
+            reinforcement_saturation=self._cfg.reinforcement_saturation,
+        )
         self._conflict_resolver = ConflictResolver(
             strategy=conflict_strategy,
             conflict_judge_fn=conflict_judge_fn,
@@ -443,6 +455,19 @@ class ContextIdx:
         Returns the stored unit ID.
         """
         self._ensure_initialized()
+        validate_scope_keys(scope)
+
+        # WAL circuit-breaker: refuse new writes when pending entries are at the limit
+        if (
+            self._wal is not None
+            and self._cfg.max_wal_entries > 0
+            and await self._wal.pending_count() >= self._cfg.max_wal_entries
+        ):
+            raise BackendError(
+                f"WAL circuit-breaker: {self._cfg.max_wal_entries} pending entries "
+                "reached. The vector backend may be unavailable. New writes are "
+                "blocked until the WAL drains. Check backend connectivity."
+            )
 
         if self._batch_writer is not None and embedding is None:
             future = await self._batch_writer.add(
@@ -583,6 +608,8 @@ class ContextIdx:
         the same order as *items*.
         """
         self._ensure_initialized()
+        for item in items:
+            validate_scope_keys(item.get("scope", {}))
         texts = [item["content"] for item in items]
         embeddings = await self._embed_batch(texts)
         ids: list[str] = []
@@ -642,6 +669,7 @@ class ContextIdx:
                 improve precision. Uses gpt-4o-mini for low latency.
         """
         self._ensure_initialized()
+        validate_scope_keys(scope)
 
         query_time = at or datetime.now(timezone.utc)
 
@@ -652,7 +680,7 @@ class ContextIdx:
             q_emb = await self._embed(query)
 
         # 2. Over-fetch from vector backend — use hybrid when supported
-        fetch_k = top_k * 3
+        fetch_k = top_k * self._cfg.overfetch_factor
         use_hybrid = getattr(self._backend, "supports_hybrid_search", False)
 
         if use_hybrid:
@@ -764,7 +792,7 @@ class ContextIdx:
                 decay_sc = self._decay_engine.compute_decay(exp_unit, query_time)
                 if decay_sc < self._decay_threshold:
                     continue
-                filtered.append((exp_unit, 0.5, None))
+                filtered.append((exp_unit, self._cfg.graph_expansion_default_score, None))
                 filtered_id_set.add(uid)
 
         # 5. Batch-load decay states, then score and rank
@@ -1150,7 +1178,11 @@ class ContextIdx:
         from contextidx.core.consolidation import find_redundant_pairs, merge_units
 
         units = await self._store.find_active_units()
-        pairs = await find_redundant_pairs(units, ann_search_fn=self._backend.search)
+        pairs = await find_redundant_pairs(
+            units,
+            threshold=self._cfg.consolidation_threshold,
+            ann_search_fn=self._backend.search,
+        )
         merged = 0
         for keeper_id, absorbed_id in pairs:
             keeper = await self._store.get_unit(keeper_id)
@@ -1172,12 +1204,20 @@ class ContextIdx:
             logger.info("Consolidation merged %d redundant pairs", merged)
 
     async def _wal_compact_tick(self) -> None:
-        """Archive applied WAL entries older than 24 hours."""
+        """Remove applied WAL entries and optionally drop unrecoverable pending ones."""
         if self._wal is None:
             return
-        removed = await self._wal.compact(retention_hours=24)
+        removed = await self._wal.compact(retention_hours=self._cfg.wal_retention_hours)
         if removed:
-            logger.info("WAL compaction removed %d entries", removed)
+            logger.info("WAL compaction removed %d applied entries", removed)
+        if self._cfg.wal_max_age_hours > 0:
+            dropped = await self._wal.drop_stale(
+                max_age_hours=self._cfg.wal_max_age_hours
+            )
+            if dropped:
+                logger.warning(
+                    "WAL stale-drop removed %d unrecoverable pending entries", dropped
+                )
 
     async def _decay_tick(self) -> None:
         """Recalculate decay scores for all active units."""

@@ -377,6 +377,38 @@ class SQLiteStore(Store):
         await self._conn.commit()
         return cursor.rowcount
 
+    async def get_pending_wal_count(self) -> int:
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM wal WHERE status = 'pending'"
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def drop_stale_wal(self, before: datetime) -> int:
+        import logging as _logging
+        _log = _logging.getLogger("contextidx.store.sqlite")
+        cursor = await self._conn.execute(
+            "SELECT seq, unit_id, written_at FROM wal"
+            " WHERE status = 'pending' AND written_at < ?",
+            (_dt_to_str(before),),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return 0
+        seqs = [r["seq"] for r in rows]
+        _log.warning(
+            "Dropping %d stale pending WAL entries (oldest: %s) — "
+            "these writes are unrecoverable",
+            len(seqs),
+            rows[0]["written_at"],
+        )
+        placeholders = ",".join("?" * len(seqs))
+        drop_cursor = await self._conn.execute(
+            f"DELETE FROM wal WHERE seq IN ({placeholders})", seqs
+        )
+        await self._conn.commit()
+        return drop_cursor.rowcount
+
     # ── Checkpoints ──
 
     async def update_checkpoint(

@@ -355,6 +355,35 @@ class PostgresStore(Store):
         # asyncpg returns "DELETE N"
         return int(result.split()[-1])
 
+    async def get_pending_wal_count(self) -> int:
+        row = await self._conn_pool.fetchrow(
+            "SELECT COUNT(*) AS n FROM wal WHERE status = 'pending'"
+        )
+        return int(row["n"]) if row else 0
+
+    async def drop_stale_wal(self, before: datetime) -> int:
+        import logging as _logging
+        _log = _logging.getLogger("contextidx.store.postgres")
+        rows = await self._conn_pool.fetch(
+            "SELECT seq, unit_id, written_at FROM wal"
+            " WHERE status = 'pending' AND written_at < $1"
+            " ORDER BY written_at",
+            before,
+        )
+        if not rows:
+            return 0
+        seqs = [r["seq"] for r in rows]
+        _log.warning(
+            "Dropping %d stale pending WAL entries (oldest: %s) — "
+            "these writes are unrecoverable",
+            len(seqs),
+            rows[0]["written_at"],
+        )
+        result = await self._conn_pool.execute(
+            "DELETE FROM wal WHERE seq = ANY($1::int[])", seqs
+        )
+        return int(result.split()[-1])
+
     # ── Checkpoints ──
 
     async def update_checkpoint(

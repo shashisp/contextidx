@@ -67,6 +67,10 @@ class WAL:
     async def mark_failed(self, seq: int) -> None:
         await self._store.mark_wal_failed(seq)
 
+    async def pending_count(self) -> int:
+        """Return the number of pending (unapplied) WAL entries."""
+        return await self._store.get_pending_wal_count()
+
     async def compact(self, retention_hours: int = 24) -> int:
         """Remove applied WAL entries older than *retention_hours*.
 
@@ -74,3 +78,11 @@ class WAL:
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
         return await self._store.compact_wal(before=cutoff)
+
+    async def drop_stale(self, max_age_hours: int) -> int:
+        """Drop pending WAL entries older than *max_age_hours* as unrecoverable.
+
+        Returns the number of entries dropped.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        return await self._store.drop_stale_wal(before=cutoff)
