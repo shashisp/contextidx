@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/utils/wal.py
-# hypothesis_version: 6.151.9
-
-['operation', 'payload', 'pending', 'seq', 'status', 'store_target', 'unit_id', 'written_at']

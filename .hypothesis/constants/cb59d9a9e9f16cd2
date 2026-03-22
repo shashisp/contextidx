@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/backends/pgvector.py
-# hypothesis_version: 6.151.9
-
-[0.5, 1536, ' AND ', ',', 'WHERE ', '[', ']', '_content', 'bm25_score', 'contextidx_vectors', 'id', 'metadata', 'row_factory', 'score', 'vec_score', '{}']

@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/store/migrations.py
-# hypothesis_version: 6.151.9
-
-[500, '=', 'MISMATCH', 'Migration Report', 'Migration failed', 'OK', 'SELECT * FROM wal', 'applied_at', 'archived_at', 'confidence', 'content', 'context_graph', 'context_units', 'created_at', 'current_score', 'decay_model', 'decay_rate', 'decay_state', 'embedding', 'expires_at', 'from_id', 'id', 'last_synced_at', 'last_updated', 'operation', 'payload', 'reinforcement_count', 'relationship', 'scope', 'source', 'status', 'store_name', 'store_target', 'superseded_by', 'sync_checkpoints', 'to_id', 'unit_id', 'units_synced', 'version', 'wal', 'written_at', '{}']
