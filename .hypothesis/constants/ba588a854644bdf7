@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/backends/weaviate.py
-# hypothesis_version: 6.151.9
-
-[0.0, 0.023, 0.5, 0.8, 1.0, 8080, 50051, ':', '://', 'ContextUnit', 'bm25_score', 'confidence', 'content', 'created_at', 'decay_model', 'decay_rate', 'default', 'expires_at', 'exponential', 'extra_metadata', 'https', 'scope', 'source', 'superseded_by', 'unit_id', 'unknown', 'user_id', 'version']

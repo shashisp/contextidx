@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/core/temporal_graph.py
-# hypothesis_version: 6.151.9
-
-['caused_by', 'relates_to', 'supersedes', 'version_of']

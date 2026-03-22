@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/store/sqlite_store.py
-# hypothesis_version: 6.151.9
-
-[' AND created_at >= ?', ',', '.contextidx/meta.db', '?', 'confidence', 'content', 'created_at', 'current_score', 'decay_model', 'decay_rate', 'embedding', 'expires_at', 'from_id', 'id', 'last_synced_at', 'last_updated', 'operation', 'payload', 'reinforcement_count', 'relationship', 'scope', 'seq', 'source', 'status', 'store_target', 'superseded_by', 'timestamp', 'to_id', 'unit_id', 'units_synced', 'version', 'written_at']

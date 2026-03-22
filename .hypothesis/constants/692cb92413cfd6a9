@@ -1,4 +1,0 @@
-# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/store/__init__.py
-# hypothesis_version: 6.151.9
-
-['BackendMetadataStore', 'MigrationReport', 'PostgresStore', 'SQLiteStore', 'Store', 'validate_migration']
