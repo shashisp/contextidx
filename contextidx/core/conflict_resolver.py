@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import re
 from enum import Enum
 from typing import Literal, Protocol, runtime_checkable
 
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
 from contextidx.utils.math_utils import cosine_similarity
+
+logger = logging.getLogger("contextidx.conflict_resolver")
 
 _VERB_PAIRS: list[tuple[str, str]] = [
     (r"\bprefers\s+", r"\bdoes\s+not\s+prefer\s+"),
@@ -20,12 +23,6 @@ class ConflictStrategy(str, Enum):
     HIGHEST_CONFIDENCE = "HIGHEST_CONFIDENCE"
     MERGE = "MERGE"
     MANUAL = "MANUAL"
-
-
-class MergeStrategy(str, Enum):
-    CONCAT = "CONCAT"
-    RECENCY_WEIGHTED = "RECENCY_WEIGHTED"
-    LLM_SUMMARIZED = "LLM_SUMMARIZED"
 
 
 class ConflictResult:
@@ -75,18 +72,12 @@ class ConflictResolver:
         ] = "LAST_WRITE_WINS",
         semantic_threshold: float = 0.80,
         conflict_judge_fn: ConflictJudgeFn | None = None,
-        merge_strategy: Literal[
-            "CONCAT", "RECENCY_WEIGHTED", "LLM_SUMMARIZED"
-        ] = "CONCAT",
         merge_fn: MergeFn | None = None,
-        confidence_boost: float = 0.2,
     ):
         self._strategy = ConflictStrategy(strategy)
         self._semantic_threshold = semantic_threshold
         self._judge_fn = conflict_judge_fn
-        self._merge_strategy = MergeStrategy(merge_strategy)
         self._merge_fn = merge_fn
-        self._confidence_boost = confidence_boost
 
     @property
     def strategy(self) -> ConflictStrategy:
@@ -137,15 +128,11 @@ class ConflictResolver:
         new_unit: ContextUnit,
         conflicting: list[ContextUnit],
     ) -> ConflictResult:
-        """Async resolve — required for LLM_SUMMARIZED merges."""
+        """Async resolve — uses merge_fn when strategy is MERGE and a merge_fn is configured."""
         if not conflicting:
             return ConflictResult(winner=new_unit, superseded=[])
 
-        if (
-            self._strategy == ConflictStrategy.MERGE
-            and self._merge_strategy == MergeStrategy.LLM_SUMMARIZED
-            and self._merge_fn is not None
-        ):
+        if self._strategy == ConflictStrategy.MERGE and self._merge_fn is not None:
             return await self._resolve_merge_llm(new_unit, conflicting)
 
         return self.resolve(new_unit, conflicting)
@@ -252,12 +239,12 @@ class ConflictResolver:
         new_unit: ContextUnit,
         conflicting: list[ContextUnit],
     ) -> ConflictResult:
-        if self._merge_strategy == MergeStrategy.RECENCY_WEIGHTED:
-            return self._resolve_merge_recency_weighted(new_unit, conflicting)
-        elif self._merge_strategy == MergeStrategy.LLM_SUMMARIZED:
-            return self._resolve_merge_recency_weighted(new_unit, conflicting)
-        else:
-            return self._resolve_merge_concat(new_unit, conflicting)
+        if self._merge_fn is not None:
+            logger.warning(
+                "merge_fn requires aresolve(); falling back to default "
+                "merge in sync resolve()"
+            )
+        return self._resolve_merge_concat(new_unit, conflicting)
 
     @staticmethod
     def _resolve_merge_concat(
@@ -284,38 +271,19 @@ class ConflictResolver:
             needs_review=True,
         )
 
-    def _resolve_merge_recency_weighted(
-        self,
-        new_unit: ContextUnit,
-        conflicting: list[ContextUnit],
-    ) -> ConflictResult:
-        old_confidence_sum = sum(u.confidence for u in conflicting)
-        boosted = new_unit.confidence + old_confidence_sum * self._confidence_boost
-        merged = new_unit.model_copy(
-            update={
-                "id": generate_unit_id(),
-                "confidence": min(1.0, boosted),
-            }
-        )
-        return ConflictResult(
-            winner=merged,
-            superseded=[new_unit, *conflicting],
-            needs_review=False,
-        )
-
     async def _resolve_merge_llm(
         self,
         new_unit: ContextUnit,
         conflicting: list[ContextUnit],
     ) -> ConflictResult:
         if self._merge_fn is None:
-            return self._resolve_merge_recency_weighted(new_unit, conflicting)
+            return self._resolve_merge_concat(new_unit, conflicting)
 
         old_contents = [u.content for u in conflicting]
         try:
             merged_content = await self._merge_fn(new_unit.content, old_contents)
         except Exception:
-            return self._resolve_merge_recency_weighted(new_unit, conflicting)
+            return self._resolve_merge_concat(new_unit, conflicting)
 
         merged = new_unit.model_copy(
             update={
