@@ -18,12 +18,46 @@ import pytest
 
 _DIM = 1536
 
+# Topic → dimension mapping for semantic test embeddings.
+# Words in the same group push mass into the same dimension so cosine
+# similarity correctly reflects topic overlap without a real ML model.
+_TOPIC_KEYWORDS: dict[str, int] = {
+    # outdoor / hiking topic  → dim 0
+    "outdoor": 0, "hiking": 0, "mountains": 0, "alps": 0,
+    "nature": 0, "activities": 0, "enjoy": 0, "hike": 0,
+    # music / piano topic     → dim 1
+    "piano": 1, "music": 1, "learning": 1, "instrument": 1,
+}
+
 
 def _deterministic_embedding(text: str) -> list[float]:
-    """Produce a deterministic embedding from text content."""
-    h = hash(text) & 0xFFFFFFFF
-    raw = [math.sin((h + i) * 0.01) for i in range(_DIM)]
+    """Topic-aware, PYTHONHASHSEED-independent embedding for tests.
+
+    Uses MD5 (not built-in ``hash()``) so the result is identical across
+    subprocesses even when PYTHONHASHSEED differs.  Strong topic signal in
+    the first few dimensions ensures semantically related texts rank above
+    unrelated ones.
+    """
+    import hashlib
+
+    text_lower = text.lower()
+    raw = [0.0] * _DIM
+
+    # Strong topic signal
+    for word, dim in _TOPIC_KEYWORDS.items():
+        if word in text_lower:
+            raw[dim] += 1.0
+
+    # Stable uniqueness noise in the remaining dimensions
+    digest = hashlib.md5(text.encode()).digest()
+    seed = int.from_bytes(digest[:4], "big")
+    for i in range(len(_TOPIC_KEYWORDS), _DIM):
+        raw[i] = math.sin((seed + i) * 0.001) * 0.01
+
     norm = math.sqrt(sum(x * x for x in raw))
+    if norm == 0.0:
+        raw[0] = 1.0
+        return raw
     return [x / norm for x in raw]
 
 
@@ -58,6 +92,8 @@ def _start_server(port: int, store_path: str):
             internal_store=store,
             conflict_detection="semantic",
             embedding_fn=FakeEmbedder(),
+            # Disable decay filtering so historical dates don't exclude units.
+            decay_threshold=0.0,
         )
         await idx.ainitialize()
         return idx

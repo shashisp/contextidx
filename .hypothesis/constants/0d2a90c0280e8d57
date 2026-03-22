@@ -1,0 +1,4 @@
+# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/core/conflict_resolver.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.5, 0.8, 'HIGHEST_CONFIDENCE', 'LAST_WRITE_WINS', 'MANUAL', 'MERGE', '\\bis\\s+a\\s+', '\\blikes\\s+', '\\bprefers\\s+', '\\bwants\\s+', 'confidence', 'content', 'id']

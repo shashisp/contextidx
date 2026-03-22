@@ -138,6 +138,10 @@ def _build_app():
         for session in req.sessions:
             if not session.messages:
                 continue
+            # Skip sessions with no user turns — assistant-only transcripts
+            # carry no user memory worth indexing.
+            if not any(m.role == "user" for m in session.messages):
+                continue
 
             meta = session.metadata or {}
             formatted_date = meta.get("formattedDate") or meta.get("date") or ""

@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Unit & integration tests ───────────────────────────────────────────────
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Install hypothesis
+        run: pip install hypothesis
+
+      - name: Run tests (excluding slow marks)
+        run: |
+          pytest tests/ -x -q \
+            -m "not slow" \
+            --tb=short \
+            --ignore=tests/test_integration/test_server.py
+        env:
+          OPENAI_API_KEY: "test-not-used"
+
+      - name: Run server integration tests
+        run: |
+          pytest tests/test_integration/test_server.py -q --tb=short
+        env:
+          OPENAI_API_KEY: "test-not-used"
+
+  # ── Lint ───────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check contextidx/ benchmarks/ scripts/
+
+  # ── Benchmark regression check ─────────────────────────────────────────────
+  benchmarks:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    # Only run on pushes to main (not PRs) to avoid flaky comparisons on
+    # shared runners with variable CPU performance.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run benchmarks and compare against stored baseline
+        run: |
+          pytest \
+            benchmarks/bench_hybrid.py \
+            benchmarks/bench_conflict.py \
+            benchmarks/bench_wal.py \
+            --benchmark-only \
+            --benchmark-compare=0001_baseline \
+            --benchmark-storage=.benchmarks \
+            --benchmark-compare-fail=mean:25% \
+            -q
+        env:
+          OPENAI_API_KEY: "test-not-used"
+
+  # ── Nightly slow benchmarks (manual or scheduled) ─────────────────────────
+  slow-benchmarks:
+    name: Slow benchmarks (consolidation at scale)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run slow consolidation benchmarks
+        run: |
+          pytest benchmarks/bench_consolidation_scale.py \
+            --benchmark-only \
+            -v \
+            -m slow
