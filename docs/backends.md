@@ -6,7 +6,7 @@ contextidx supports multiple vector database backends. Each implements the `Vect
 
 | Backend | Hybrid Search | Native Metadata | Setup Complexity |
 |---------|:---:|:---:|:---:|
-| PGVector | No | Yes | Medium |
+| PGVector | Yes (BM25 + vector RRF) | Yes | Medium |
 | Weaviate | Yes | No | Medium |
 | Qdrant | No | No | Low |
 | ChromaDB | No | No | Low |

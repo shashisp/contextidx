@@ -47,12 +47,12 @@ Default weights (when `None`):
 
 ```python
 {
-    "semantic": 0.35,
-    "recency": 0.20,
-    "confidence": 0.15,
-    "decay": 0.15,
-    "reinforcement": 0.10,
-    "bm25": 0.05,
+    "semantic": 0.30,
+    "recency": 0.25,
+    "confidence": 0.20,
+    "decay": 0.10,
+    "reinforcement": 0.05,
+    "bm25": 0.10,
 }
 ```
 
