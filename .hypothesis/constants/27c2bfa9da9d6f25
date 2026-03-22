@@ -1,0 +1,4 @@
+# file: /Users/shashikumarp/sideprojects/ctxidx/contextidx/contextidx.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.01, 0.1, 0.2, 0.5, 0.8, 1.0, 30.0, 60.0, 120, '.contextidx/graph.db', '.contextidx/meta.db', '1', '429', 'HIGHEST_CONFIDENCE', 'LAST_WRITE_WINS', 'MANUAL', 'MERGE', 'RetryCallState', 'Stored unit %s', '_content', 'archived_at', 'auto', 'bm25_score', 'both', 'checked', 'checkpoint', 'clear_scope', 'close', 'confidence', 'content', 'contextidx', 'd', 'embedding', 'errors', 'exponential', 'h', 'json', 'linear', 'llm', 'm', 'memory', 'postgres', 'postgresql://', 'redis', 'reinserted', 'relates_to', 'rule_based', 'scope', 'semantic', 'source', 'sqlite', 'step', 'store', 'superseded_by', 'supersedes', 'tiered', 'unknown', 'vector_backend', 'version']
