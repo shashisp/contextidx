@@ -548,7 +548,7 @@ class ContextIdx:
         if self._conflict_detection == "tiered":
             inline, candidates = self._conflict_resolver.detect_tiered(unit, existing)
             if inline:
-                result = self._conflict_resolver.resolve(unit, inline)
+                result = await self._conflict_resolver.aresolve(unit, inline)
                 unit = result.winner
                 superseded_units = result.superseded
             if candidates and self._conflict_queue is not None:
@@ -556,19 +556,19 @@ class ContextIdx:
         elif self._conflict_detection == "llm":
             conflicts = await self._conflict_resolver.detect_llm_conflicts(unit, existing)
             if conflicts:
-                result = self._conflict_resolver.resolve(unit, conflicts)
+                result = await self._conflict_resolver.aresolve(unit, conflicts)
                 unit = result.winner
                 superseded_units = result.superseded
         elif self._conflict_detection == "semantic":
             conflicts = self._conflict_resolver.detect_semantic_conflicts(unit, existing)
             if conflicts:
-                result = self._conflict_resolver.resolve(unit, conflicts)
+                result = await self._conflict_resolver.aresolve(unit, conflicts)
                 unit = result.winner
                 superseded_units = result.superseded
         else:
             conflicts = self._conflict_resolver.detect_conflicts(unit, existing)
             if conflicts:
-                result = self._conflict_resolver.resolve(unit, conflicts)
+                result = await self._conflict_resolver.aresolve(unit, conflicts)
                 unit = result.winner
                 superseded_units = result.superseded
 
