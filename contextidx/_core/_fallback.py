@@ -70,6 +70,32 @@ def batch_score(
     return out
 
 
+def batch_cosine_similarity(
+    query: list[float],
+    candidates_flat: list[float],
+    dim: int,
+) -> list[float]:
+    """Cosine similarity of one query against N candidates (row-major flat)."""
+    if dim == 0:
+        return []
+    n = len(candidates_flat) // dim
+    q_norm = math.sqrt(sum(v * v for v in query))
+    if q_norm == 0.0:
+        return [0.0] * n
+    out: list[float] = []
+    for row in range(n):
+        offset = row * dim
+        dot = 0.0
+        c_norm_sq = 0.0
+        for j in range(dim):
+            cj = candidates_flat[offset + j]
+            dot += query[j] * cj
+            c_norm_sq += cj * cj
+        c_norm = math.sqrt(c_norm_sq)
+        out.append(dot / (q_norm * c_norm) if c_norm > 0.0 else 0.0)
+    return out
+
+
 _NEGATION_WORDS = re.compile(r"\bnot\b|\bno\b|\bnever\b|\bdon'?t\b", re.IGNORECASE)
 
 _VERB_PAIRS: list[tuple[str, str]] = [

@@ -34,7 +34,6 @@ from contextidx.exceptions import (
 from contextidx.store.base import Store, validate_scope_keys
 from contextidx.store.sqlite_store import SQLiteStore
 from contextidx.utils.batch_writer import BatchWriter
-from contextidx.utils.math_utils import cosine_similarity
 from contextidx.utils.conflict_queue import ConflictQueue
 from contextidx.utils.pending_buffer import PendingBuffer
 from contextidx.utils.wal import WAL
@@ -738,7 +737,8 @@ class ContextIdx:
                 sup_units = await self._store.get_units_batch(superseder_ids)
                 units_map.update(sup_units)
 
-        filtered: list[tuple[ContextUnit, float, float | None]] = []
+        # Phase 1: cheap attribute checks (scope, superseded, expired)
+        pre_decay: list[tuple[ContextUnit, float, float | None]] = []
         for unit, sem_score, bm25 in candidates:
             if not unit.matches_scope(scope):
                 continue
@@ -757,12 +757,29 @@ class ContextIdx:
                     sup_unit = units_map.get(superseder)
                     if sup_unit and sup_unit.timestamp <= at:
                         continue
+            pre_decay.append((unit, sem_score, bm25))
 
-            decay_score = self._decay_engine.compute_decay(unit, query_time)
-            if decay_score < self._decay_threshold:
-                continue
+        # Phase 2: batch decay filter (reinforcement_count=0 for pre-filter,
+        # matching the original per-unit compute_decay default)
+        filtered: list[tuple[ContextUnit, float, float | None]] = []
+        if pre_decay:
+            pd_units = [u for u, _, _ in pre_decay]
+            pd_model_groups: dict[str, list[int]] = {}
+            for i, u in enumerate(pd_units):
+                pd_model_groups.setdefault(u.decay_model, []).append(i)
 
-            filtered.append((unit, sem_score, bm25))
+            pd_scores = [0.0] * len(pd_units)
+            for _model, indices in pd_model_groups.items():
+                group_units = [pd_units[i] for i in indices]
+                group_decays = self._decay_engine.batch_compute_decay(
+                    group_units, query_time
+                )
+                for idx, ds in zip(indices, group_decays):
+                    pd_scores[idx] = ds
+
+            for i, (unit, sem_score, bm25) in enumerate(pre_decay):
+                if pd_scores[i] >= self._decay_threshold:
+                    filtered.append((unit, sem_score, bm25))
 
         # 4b. Graph expansion: follow RELATES_TO edges from top candidates
         # to pull in neighboring context that vector search may have missed.
@@ -783,7 +800,12 @@ class ContextIdx:
                     expansion_ids.add(rid)
 
         if expansion_ids:
+            from contextidx._core import batch_cosine_similarity
+
             expanded_units = await self._store.get_units_batch(list(expansion_ids))
+
+            # Pre-filter: scope, status (cheap), then batch decay
+            pre_decay_exp: list[tuple[str, ContextUnit]] = []
             for uid, exp_unit in expanded_units.items():
                 if exp_unit is None:
                     continue
@@ -791,18 +813,51 @@ class ContextIdx:
                     continue
                 if not exp_unit.matches_scope(scope):
                     continue
-                decay_sc = self._decay_engine.compute_decay(exp_unit, query_time)
-                if decay_sc < self._decay_threshold:
-                    continue
-                if q_emb and exp_unit.embedding:
-                    sim = cosine_similarity(q_emb, exp_unit.embedding)
-                    if sim < self._cfg.graph_expansion_min_score:
-                        continue
-                    exp_score = sim
-                else:
-                    exp_score = self._cfg.graph_expansion_default_score
-                filtered.append((exp_unit, exp_score, None))
-                filtered_id_set.add(uid)
+                pre_decay_exp.append((uid, exp_unit))
+
+            eligible: list[tuple[str, ContextUnit]] = []
+            if pre_decay_exp:
+                exp_units_list = [u for _, u in pre_decay_exp]
+                exp_model_groups: dict[str, list[int]] = {}
+                for i, u in enumerate(exp_units_list):
+                    exp_model_groups.setdefault(u.decay_model, []).append(i)
+
+                exp_decay_scores = [0.0] * len(exp_units_list)
+                for _model, indices in exp_model_groups.items():
+                    group_units = [exp_units_list[i] for i in indices]
+                    group_decays = self._decay_engine.batch_compute_decay(
+                        group_units, query_time
+                    )
+                    for idx, ds in zip(indices, group_decays):
+                        exp_decay_scores[idx] = ds
+
+                for i, (uid, exp_unit) in enumerate(pre_decay_exp):
+                    if exp_decay_scores[i] >= self._decay_threshold:
+                        eligible.append((uid, exp_unit))
+
+            # Batch cosine similarity for units that have embeddings
+            if q_emb and eligible:
+                dim = len(q_emb)
+                with_emb = [(uid, u) for uid, u in eligible if u.embedding]
+                without_emb = [(uid, u) for uid, u in eligible if not u.embedding]
+
+                if with_emb:
+                    flat: list[float] = []
+                    for _, u in with_emb:
+                        flat.extend(u.embedding)  # type: ignore[arg-type]
+                    sims = batch_cosine_similarity(q_emb, flat, dim)
+                    for (uid, u), sim in zip(with_emb, sims):
+                        if sim >= self._cfg.graph_expansion_min_score:
+                            filtered.append((u, sim, None))
+                            filtered_id_set.add(uid)
+
+                for uid, u in without_emb:
+                    filtered.append((u, self._cfg.graph_expansion_default_score, None))
+                    filtered_id_set.add(uid)
+            else:
+                for uid, exp_unit in eligible:
+                    filtered.append((exp_unit, self._cfg.graph_expansion_default_score, None))
+                    filtered_id_set.add(uid)
 
         # 5. Batch-load decay states, then score and rank
         filtered_ids = [unit.id for unit, _, _ in filtered]
@@ -824,23 +879,78 @@ class ContextIdx:
             reinforcement_saturation=self._cfg.reinforcement_saturation,
         )
 
-        scored: list[tuple[ContextUnit, float, float]] = []
-        for unit, sem_score, bm25 in filtered:
+        # Build parallel arrays for batch Rust computation
+        units_list = [unit for unit, _, _ in filtered]
+        sem_scores = [sem for _, sem, _ in filtered]
+        bm25_raw = [bm25 for _, _, bm25 in filtered]
+        n_filtered = len(units_list)
+
+        reinforcement_counts: list[int] = []
+        for unit in units_list:
             state = decay_states.get(unit.id)
-            reinforcement_count = state[2] if state else 0
-            decay_score = self._decay_engine.compute_decay(
-                unit, query_time, reinforcement_count
+            reinforcement_counts.append(state[2] if state else 0)
+
+        # Batch-compute decay, grouping by model so the Rust kernel gets a
+        # uniform model string (required by batch_decay).
+        all_decay_scores = [0.0] * n_filtered
+        model_groups: dict[str, list[int]] = {}
+        for i, unit in enumerate(units_list):
+            model_groups.setdefault(unit.decay_model, []).append(i)
+        for _model, indices in model_groups.items():
+            group_units = [units_list[i] for i in indices]
+            group_rcs = [reinforcement_counts[i] for i in indices]
+            group_decays = self._decay_engine.batch_compute_decay(
+                group_units, query_time, group_rcs
             )
-            composite = scoring_engine.compute_score(
-                unit=unit,
-                semantic_score=sem_score,
-                query_time=query_time,
-                decay_score=decay_score,
-                reinforcement_count=reinforcement_count,
-                bm25_score=bm25,
-            )
-            if composite >= min_score:
-                scored.append((unit, composite, decay_score))
+            for idx, ds in zip(indices, group_decays):
+                all_decay_scores[idx] = ds
+
+        # Batch-compute composite scores.  `compute_score` redistributes
+        # weights when bm25 is absent, so we must split candidates by bm25
+        # availability to preserve identical scoring semantics.
+        has_any_bm25 = any(b is not None for b in bm25_raw)
+        composites = [0.0] * n_filtered
+
+        if not has_any_bm25:
+            if n_filtered:
+                composites = scoring_engine.batch_compute_score(
+                    units_list, sem_scores, query_time,
+                    all_decay_scores, reinforcement_counts,
+                    bm25_scores=None,
+                )
+        else:
+            bm25_idx = [i for i, b in enumerate(bm25_raw) if b is not None]
+            no_bm25_idx = [i for i, b in enumerate(bm25_raw) if b is None]
+
+            if bm25_idx:
+                b_scores = scoring_engine.batch_compute_score(
+                    [units_list[i] for i in bm25_idx],
+                    [sem_scores[i] for i in bm25_idx],
+                    query_time,
+                    [all_decay_scores[i] for i in bm25_idx],
+                    [reinforcement_counts[i] for i in bm25_idx],
+                    bm25_scores=[bm25_raw[i] for i in bm25_idx],  # type: ignore[list-item]
+                )
+                for idx, sc in zip(bm25_idx, b_scores):
+                    composites[idx] = sc
+
+            if no_bm25_idx:
+                nb_scores = scoring_engine.batch_compute_score(
+                    [units_list[i] for i in no_bm25_idx],
+                    [sem_scores[i] for i in no_bm25_idx],
+                    query_time,
+                    [all_decay_scores[i] for i in no_bm25_idx],
+                    [reinforcement_counts[i] for i in no_bm25_idx],
+                    bm25_scores=None,
+                )
+                for idx, sc in zip(no_bm25_idx, nb_scores):
+                    composites[idx] = sc
+
+        scored: list[tuple[ContextUnit, float, float]] = [
+            (units_list[i], composites[i], all_decay_scores[i])
+            for i in range(n_filtered)
+            if composites[i] >= min_score
+        ]
 
         effective_bias = recency_bias if recency_bias is not None else self._recency_bias
         if effective_bias and effective_bias > 0 and scored:

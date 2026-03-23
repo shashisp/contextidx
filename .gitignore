@@ -19,6 +19,10 @@ dist/
 build/
 target/
 *.egg-info/
+*.so
+*.dylib
+*.dSYM/
+.hypothesis/
 
 .ruff_cache/
 .mypy_cache/
