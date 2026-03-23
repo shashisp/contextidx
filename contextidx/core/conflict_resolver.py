@@ -6,7 +6,6 @@ from enum import Enum
 from typing import Literal, Protocol, runtime_checkable
 
 from contextidx.core.context_unit import ContextUnit, generate_unit_id
-from contextidx.utils.math_utils import cosine_similarity
 
 logger = logging.getLogger("contextidx.conflict_resolver")
 
@@ -92,16 +91,20 @@ class ConflictResolver:
 
         Checks for explicit negation patterns and high keyword overlap
         between the new unit and each existing non-superseded unit in scope.
+        Uses the Rust ``detect_contradictions`` batch kernel when available.
         """
-        conflicts: list[ContextUnit] = []
-        for existing in existing_units:
-            if existing.is_superseded:
-                continue
-            if not existing.matches_scope(new_unit.scope):
-                continue
-            if self._is_contradictory(new_unit.content, existing.content):
-                conflicts.append(existing)
-        return conflicts
+        from contextidx._core import detect_contradictions
+
+        eligible = [
+            u for u in existing_units
+            if not u.is_superseded and u.matches_scope(new_unit.scope)
+        ]
+        if not eligible:
+            return []
+
+        contents = [u.content for u in eligible]
+        flags = detect_contradictions(new_unit.content, contents)
+        return [u for u, is_conflict in zip(eligible, flags) if is_conflict]
 
     def resolve(
         self,
@@ -148,25 +151,32 @@ class ConflictResolver:
         treated as being about the same topic/attribute.  When that
         happens the newer unit supersedes the older one — no explicit
         negation pattern is required.
+
+        Uses the Rust ``batch_cosine_similarity`` kernel for a single
+        PyO3 crossing instead of per-unit Python calls.
         """
         if not new_unit.embedding:
             return []
 
-        conflicts: list[ContextUnit] = []
-        for existing in existing_units:
-            if existing.is_superseded:
-                continue
-            if not existing.matches_scope(new_unit.scope):
-                continue
-            if not existing.embedding:
-                continue
-            if existing.id == new_unit.id:
-                continue
+        from contextidx._core import batch_cosine_similarity
 
-            sim = cosine_similarity(new_unit.embedding, existing.embedding)
-            if sim >= self._semantic_threshold:
-                conflicts.append(existing)
-        return conflicts
+        eligible = [
+            u for u in existing_units
+            if not u.is_superseded
+            and u.matches_scope(new_unit.scope)
+            and u.embedding
+            and u.id != new_unit.id
+        ]
+        if not eligible:
+            return []
+
+        dim = len(new_unit.embedding)
+        flat: list[float] = []
+        for u in eligible:
+            flat.extend(u.embedding)  # type: ignore[arg-type]
+
+        sims = batch_cosine_similarity(new_unit.embedding, flat, dim)
+        return [u for u, sim in zip(eligible, sims) if sim >= self._semantic_threshold]
 
     async def detect_llm_conflicts(
         self,

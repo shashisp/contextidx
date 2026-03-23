@@ -88,6 +88,50 @@ fn batch_score(
     Ok(out)
 }
 
+/// Batch cosine similarity: one query vector against N candidate vectors.
+///
+/// `candidates_flat` is the row-major flattened matrix of N vectors, each of
+/// length `dim`.  Returns N similarity values.  Zero-norm vectors yield 0.0.
+#[pyfunction]
+fn batch_cosine_similarity(
+    query: Vec<f64>,
+    candidates_flat: Vec<f64>,
+    dim: usize,
+) -> PyResult<Vec<f64>> {
+    if dim == 0 {
+        return Ok(vec![]);
+    }
+    let n = candidates_flat.len() / dim;
+    let mut out = Vec::with_capacity(n);
+
+    let mut q_norm_sq: f64 = 0.0;
+    for &v in &query {
+        q_norm_sq += v * v;
+    }
+    let q_norm = q_norm_sq.sqrt();
+    if q_norm == 0.0 {
+        return Ok(vec![0.0; n]);
+    }
+
+    for row in 0..n {
+        let offset = row * dim;
+        let mut dot: f64 = 0.0;
+        let mut c_norm_sq: f64 = 0.0;
+        for j in 0..dim {
+            let cj = candidates_flat[offset + j];
+            dot += query[j] * cj;
+            c_norm_sq += cj * cj;
+        }
+        let c_norm = c_norm_sq.sqrt();
+        if c_norm == 0.0 {
+            out.push(0.0);
+        } else {
+            out.push(dot / (q_norm * c_norm));
+        }
+    }
+    Ok(out)
+}
+
 /// Batch rule-based contradiction detection.
 ///
 /// Returns a Vec<bool> where true means a contradiction was detected
@@ -165,6 +209,7 @@ fn check_verb_pairs(a: &str, b: &str) -> bool {
 fn _core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_decay, m)?)?;
     m.add_function(wrap_pyfunction!(batch_score, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_cosine_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(detect_contradictions, m)?)?;
     Ok(())
 }

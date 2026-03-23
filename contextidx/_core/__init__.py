@@ -8,10 +8,26 @@ Check ``RUST_AVAILABLE`` to see which backend is active.
 """
 
 try:
-    from contextidx._core_rs import batch_decay, batch_score, detect_contradictions  # type: ignore[import-not-found]
+    from contextidx._core_rs import (  # type: ignore[import-not-found]
+        batch_cosine_similarity,
+        batch_decay,
+        batch_score,
+        detect_contradictions,
+    )
     RUST_AVAILABLE = True
 except ImportError:
-    from contextidx._core._fallback import batch_decay, batch_score, detect_contradictions
+    from contextidx._core._fallback import (
+        batch_cosine_similarity,
+        batch_decay,
+        batch_score,
+        detect_contradictions,
+    )
     RUST_AVAILABLE = False
 
-__all__ = ["batch_decay", "batch_score", "detect_contradictions", "RUST_AVAILABLE"]
+__all__ = [
+    "batch_cosine_similarity",
+    "batch_decay",
+    "batch_score",
+    "detect_contradictions",
+    "RUST_AVAILABLE",
+]
